@@ -3,9 +3,10 @@ requires = [
     "setuptools",
     "wheel",
     "build",
-    "torch",
     "numpy",
     "ninja",
+    "torch>=2.5",
+    "torchvision>=0.20",
 ]
 build-backend = "setuptools.build_meta"
 
@@ -21,3 +22,12 @@ dependencies = [
     "torch",
     "numpy",
 ]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu130" }
+torchvision = { index = "pytorch-cu130" }
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
