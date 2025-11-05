@@ -23,18 +23,12 @@ if platform.system() == 'Darwin':
     extra_link_args.append('-mmacosx-version-min=10.13')
 
 extensions = [
-    CppExtension(
-        name='fused_experts.C.csrc.fused_experts',
-        sources=[os.path.join(CSRC_DIR, 'fused_experts.cpp')],
-        extra_compile_args=extra_compile_args,
-        extra_link_args=extra_link_args,
-    ),
     CUDAExtension(
         name='fused_experts.C.csrc.kernel',
         sources=[os.path.join(CSRC_DIR, 'kernel.cu')],
         extra_compile_args=extra_compile_args,
         extra_link_args=extra_link_args,
-    )
+    ),
 ]
 
 setup(
