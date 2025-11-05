@@ -1,7 +1,9 @@
 import torch
 
 def fused_experts_kernel(
-    hidden_states: torch.Tensor,
-    w1: torch.Tensor,
-    w2: torch.Tensor,
+    x: torch.Tensor,
+    wgt: torch.Tensor,
+    wut: torch.Tensor,
+    wdt: torch.Tensor,
+    offsets: torch.Tensor
 ) -> torch.Tensor: ...
