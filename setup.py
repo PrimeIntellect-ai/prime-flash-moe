@@ -1,8 +1,11 @@
+from pathlib import Path
+
 from setuptools import setup
 import os
 import platform
 from torch.utils.cpp_extension import BuildExtension, CppExtension, CUDAExtension
 
+ROOT = Path(__file__).parent.resolve()
 CSRC_DIR = os.path.join('fused_experts', 'C', 'csrc')
 
 if os.environ.get('DEBUG'):
@@ -11,6 +14,14 @@ else:
     extra_compile_args = ['-O3']
 
 extra_link_args: list[str] = []
+
+CUTLASS = ROOT / 'extern' / 'cutlass'
+
+cutlass_includes = [
+    str(CUTLASS / 'include'),
+    str(CUTLASS / 'cute' / 'include'),
+    str(CUTLASS / 'tools' / 'library' / 'include'),
+]
 
 # Add macOS specific flags
 if platform.system() == 'Darwin':
@@ -28,6 +39,7 @@ extensions = [
         sources=[os.path.join(CSRC_DIR, 'kernel.cu')],
         extra_compile_args=extra_compile_args,
         extra_link_args=extra_link_args,
+        include_dirs=cutlass_includes,
     ),
 ]
 

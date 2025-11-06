@@ -1,5 +1,8 @@
 #include <torch/torch.h>
 
+#include <cutlass/cutlass.h>
+#include <cutlass/gemm/device/gemm.h>
+
 namespace py = pybind11;
 
 static constexpr auto AT_DTYPE = at::ScalarType::BFloat16;
