@@ -6,26 +6,41 @@
 
 namespace py = pybind11;
 
-using CutlassGemm = cutlass::gemm::device::Gemm<
-    cutlass::bfloat16_t, cutlass::layout::RowMajor,
-    cutlass::bfloat16_t, cutlass::layout::RowMajor,
-    cutlass::bfloat16_t, cutlass::layout::RowMajor,
-    float
->;
+/*
+    gate = x @ wgt
+    up = x @ wut
+    act = silu(gate) * up
+    out = act @ wdt
+*/
 
-static void gemm_bf16(const cutlass::bfloat16_t* A, int M, int K, int lda, const cutlass::bfloat16_t* B, int N, int ldb, cutlass::bfloat16_t* C, int ldc) {
-    cutlass::gemm::GemmCoord problem_size(M, N, K);
-    CutlassGemm gemm_op;
-    CutlassGemm::Arguments args(
-        problem_size,
-        {A, lda},
-        {B, ldb},
-        {C, ldc},
-        {C, ldc},
-        {1.0f, 0.0f}
-    );
-    auto status = gemm_op(args);
-    TORCH_CHECK(status == cutlass::Status::kSuccess, "CUTLASS GEMM failed");
+constexpr int TILE_N = 64;   // tokens per block tile
+constexpr int TILE_H = 64;   // hidden per tile
+constexpr int TILE_D = 32;   // D chunk
+constexpr int TILE_M = 64;   // output per tile
+constexpr int THREADS = 256;
+constexpr size_t SMEM = (TILE_N*TILE_H*2 + TILE_H*TILE_M) * sizeof(float);
+
+static __global__ void fused_experts_megakernel(
+    const __nv_bfloat16* __restrict__ x,    // [N, D]
+    const __nv_bfloat16* __restrict__ wgt,  // [E, D, H]
+    const __nv_bfloat16* __restrict__ wut,  // [E, D, H]
+    const __nv_bfloat16* __restrict__ wdt,  // [E, H, M]
+    const int32_t* __restrict__ offsets,    // [E+1]
+    __nv_bfloat16* __restrict__ out,        // [N, M]
+    int E,
+    int D,
+    int H,
+    int N,
+    int M
+) {
+    // zero out for now
+    int idx = blockIdx.x * TILE_N + threadIdx.x;
+    int idy = threadIdx.y;
+    for (int m = idy; m < M; m += blockDim.y)
+        for (int n = threadIdx.x; n < TILE_N; n += blockDim.x) {
+            if (idx + n < N)
+                out[(idx + n) * M + m] = __float2bfloat16(0.0f);
+        }
 }
 
 
@@ -70,27 +85,22 @@ static void gemm_bf16(const cutlass::bfloat16_t* A, int M, int K, int lda, const
     TORCH_CHECK(wdt.size(0) == E, "wdt size mismatch");
     TORCH_CHECK(wdt.size(1) == H, "wdt size mismatch");
     TORCH_CHECK(offsets.size(0) == E, "offsets size mismatch");
-    auto out = torch::empty({N, H}, x.options());
-    auto offsets_cpu = offsets.to(at::kCPU);
-    const int32_t* off = offsets_cpu.data_ptr<int32_t>();
-    auto* x_ptr   = reinterpret_cast<const cutlass::bfloat16_t*>(x.data_ptr<at::BFloat16>());
-    auto* wgt_ptr = reinterpret_cast<const cutlass::bfloat16_t*>(wgt.data_ptr<at::BFloat16>());
-    auto* out_ptr = reinterpret_cast<cutlass::bfloat16_t*>(out.data_ptr<at::BFloat16>());
-    for (int64_t e = 0; e < E; ++e) {
-        int64_t row_start = off[e];
-        int64_t row_end = off[e+1];
-        int64_t Ne = row_end - row_start;
-        if (Ne <= 0) continue;
-        const cutlass::bfloat16_t* A = x_ptr + row_start * D;
-        const cutlass::bfloat16_t* B = wgt_ptr + e * (D * H);
-        cutlass::bfloat16_t* C = out_ptr + row_start * H;
-        gemm_bf16(
-            A, Ne, D, D,
-            B, H,  H,
-            C, H
-        );
-    }
 
+    auto out = torch::zeros({N, M}, x.options());
+    int blocks = static_cast<int>(E);
+    fused_experts_megakernel<<<blocks, THREADS, SMEM>>>(
+        reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const __nv_bfloat16*>(wgt.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const __nv_bfloat16*>(wut.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const __nv_bfloat16*>(wdt.data_ptr<at::BFloat16>()),
+        offsets.data_ptr<int32_t>(),
+        reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()),
+        static_cast<int>(E),
+        static_cast<int>(D),
+        static_cast<int>(H),
+        static_cast<int>(N),
+        static_cast<int>(M)
+    );
     return out;
 
 /*
