@@ -13,12 +13,14 @@ namespace py = pybind11;
     out = act @ wdt
 */
 
-constexpr int TILE_N = 64;   // tokens per block tile
-constexpr int TILE_H = 64;   // hidden per tile
-constexpr int TILE_D = 32;   // D chunk
-constexpr int TILE_M = 64;   // output per tile
-constexpr int THREADS = 256;
-constexpr size_t SMEM = (TILE_N*TILE_H*2 + TILE_H*TILE_M) * sizeof(float);
+constexpr int TN = 128;
+constexpr int TH = 32;
+constexpr int TD = 32;
+constexpr int TM = 64;
+
+[[nodiscard]] __device__ __forceinline__ static float silu(float x) {
+    return x*(1.f/(1.f+__expf(-x)));
+}
 
 static __global__ void fused_experts_megakernel(
     const __nv_bfloat16* __restrict__ x,    // [N, D]
@@ -33,14 +35,62 @@ static __global__ void fused_experts_megakernel(
     int N,
     int M
 ) {
-    // zero out for now
-    int idx = blockIdx.x * TILE_N + threadIdx.x;
-    int idy = threadIdx.y;
-    for (int m = idy; m < M; m += blockDim.y)
-        for (int n = threadIdx.x; n < TILE_N; n += blockDim.x) {
-            if (idx + n < N)
-                out[(idx + n) * M + m] = __float2bfloat16(0.0f);
+    int e = blockIdx.x;
+    if (e >= E) return;
+    int start = e ? offsets[e-1] : 0;
+    int end = offsets[e];
+    int nume = end - start;
+    int tid = threadIdx.x;
+    if (tid >= nume) return;
+    int ni = start + tid;
+    const auto* wg = wgt + e*D*H;
+    const auto* wu = wut + e*D*H;
+    const auto* wd = wdt + e*H*M;
+    for (int m=0; m < M; m += TM) {
+        int vm = min(TM, M-m);
+        float acc[TM] = {};
+        for (int h=0; h < H; h += TH) {
+            int vh = min(TH, H-h);
+            float gf[TH] = {}, uf[TH] = {};
+            for (int d=0; d < D; d += TD) {
+                int vd = min(TD, D-d);
+                for (int dd=0; dd < TD; ++dd) {
+                    if (dd >= vd) break;
+                    float xv = __bfloat162float(x[ni*D + (d+dd)]);
+                    for (int hh=0; hh < TH; ++hh) {
+                        if (hh >= vh) break;
+                        float wgv = __bfloat162float(wg[(d+dd)*H + (h+hh)]);
+                        float wuv = __bfloat162float(wu[(d+dd)*H + (h+hh)]);
+                        gf[hh] += xv*wgv;
+                        uf[hh] += xv*wuv;
+                    }
+                }
+            }
+            float act[TH];
+            #pragma unroll
+            for (int hh=0; hh < TH; ++hh) {
+                if (hh >= vh) break;
+                act[hh] = silu(gf[hh])*uf[hh];
+            }
+            for (int hh=0; hh < TH; ++hh) {
+                if (hh >= vh) break;
+                float a = act[hh];
+                const __nv_bfloat16* wd_row = wd + (h+hh)*M + m;
+                #pragma unroll
+                for (int mm=0; mm < TM; ++mm) {
+                    if (mm >= vm) break;
+                    float w = __bfloat162float(wd_row[mm]);
+                    acc[mm] += a*w;
+                }
+            }
         }
+        __nv_bfloat16* o_row = out + ni*M + m;
+        #pragma unroll
+        for (int mm=0; mm < TM; ++mm) {
+            if (mm >= vm) break;
+            o_row[mm] = __float2bfloat16(acc[mm]);
+        }
+    }
 }
 
 
@@ -87,8 +137,9 @@ static __global__ void fused_experts_megakernel(
     TORCH_CHECK(offsets.size(0) == E, "offsets size mismatch");
 
     auto out = torch::zeros({N, M}, x.options());
-    int blocks = static_cast<int>(E);
-    fused_experts_megakernel<<<blocks, THREADS, SMEM>>>(
+    dim3 block {TN, 1, 1};
+    dim3 grid {static_cast<unsigned>(E), 1};
+    fused_experts_megakernel<<<grid, block>>>(
         reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()),
         reinterpret_cast<const __nv_bfloat16*>(wgt.data_ptr<at::BFloat16>()),
         reinterpret_cast<const __nv_bfloat16*>(wut.data_ptr<at::BFloat16>()),
