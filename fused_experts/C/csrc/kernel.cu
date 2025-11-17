@@ -39,9 +39,9 @@ static __global__ void fused_experts_megakernel(
     if (e >= E) return;
     int start = e ? offsets[e-1] : 0;
     int end = offsets[e];
-    int nume = end - start;
+    int numel = end - start;
     int tid = threadIdx.x;
-    if (tid >= nume) return;
+    if (tid >= numel) return;
     int ni = start + tid;
     const auto* wg = wgt + e*D*H;
     const auto* wu = wut + e*D*H;
@@ -75,7 +75,7 @@ static __global__ void fused_experts_megakernel(
             for (int hh=0; hh < TH; ++hh) {
                 if (hh >= vh) break;
                 float a = act[hh];
-                const __nv_bfloat16* wd_row = wd + (h+hh)*M + m;
+                const auto* wd_row = wd + (h+hh)*M + m;
                 #pragma unroll
                 for (int mm=0; mm < TM; ++mm) {
                     if (mm >= vm) break;
@@ -84,7 +84,7 @@ static __global__ void fused_experts_megakernel(
                 }
             }
         }
-        __nv_bfloat16* o_row = out + ni*M + m;
+        auto* o_row = out + ni*M + m;
         #pragma unroll
         for (int mm=0; mm < TM; ++mm) {
             if (mm >= vm) break;
@@ -153,34 +153,6 @@ static __global__ void fused_experts_megakernel(
         static_cast<int>(M)
     );
     return out;
-
-/*
-    REF
-
-    at::Tensor gate_proj = at::_grouped_mm(
-        x,
-        wgt,
-        offsets,
-        std::nullopt,
-        at::ScalarType::BFloat16
-    );
-    at::Tensor up_proj = at::_grouped_mm(
-        x,
-        wut,
-        offsets,
-        std::nullopt,
-        at::ScalarType::BFloat16
-    );
-    at::Tensor activated = at::mul(at::silu(gate_proj), up_proj);
-    at::Tensor down_proj = at::_grouped_mm(
-        activated,
-        wdt,
-        offsets,
-        std::nullopt,
-        at::ScalarType::BFloat16
-    );
-    return down_proj;
-    */
 }
 
 PYBIND11_MODULE(kernel, m) {

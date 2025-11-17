@@ -47,6 +47,7 @@ def moe_naive() -> torch.Tensor:
 
 y_naive = moe_naive()
 y_fused = fe.fused_experts_kernel(x, wgT, wuT, wdT, offs)
+max = (y_naive - y_fused).abs().max()
 torch.testing.assert_close(y_fused, y_naive)
 
 print('Test passed!')
