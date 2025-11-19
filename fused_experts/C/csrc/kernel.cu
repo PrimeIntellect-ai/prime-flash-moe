@@ -40,58 +40,116 @@ static __global__ void fused_experts_megakernel(
 ) {
     int e = blockIdx.x;
     if (e >= E) return;
-    int start = e ? offsets[e-1] : 0;
-    int end = offsets[e];
-    int numel = end - start;
+    int startE = !e ? 0 : offsets[e-1];
+    int endE = offsets[e];
+    int nE = endE-startE;
+    if (nE <= 0) return;
+    int tileStart = blockIdx.y*blockDim.x;
+    int tileEnd = tileStart+blockDim.x;
+    if (tileStart >= endE || tileEnd <= startE) return;
     int tid = threadIdx.x;
-    if (tid >= numel) return;
-    int ni = start + tid;
-    const auto *wg = wgt + e*D*H;
-    const auto *wu = wut + e*D*H;
-    const auto *wd = wdt + e*H*M;
-    for (int m=0; m < M; m += TM) {
-        int vm = min(TM, M-m);
-        float acc[TM] = {};
-        for (int h=0; h < H; h += TH) {
-            int vh = min(TH, H-h);
-            float gf[TH] = {}, uf[TH] = {};
-            for (int d=0; d < D; d += TD) {
-                int vd = min(TD, D-d);
-                for (int dd=0; dd < TD; ++dd) {
-                    if (dd >= vd) break;
-                    float xv = __bfloat162float(x[ni*D + (d+dd)]);
-                    for (int hh=0; hh < TH; ++hh) {
-                        if (hh >= vh) break;
-                        float wgv = __bfloat162float(wg[(d+dd)*H + (h+hh)]);
-                        float wuv = __bfloat162float(wu[(d+dd)*H + (h+hh)]);
-                        gf[hh] += xv*wgv;
-                        uf[hh] += xv*wuv;
+    int ni = tileStart + tid;
+    bool active = ni >= startE && ni < endE;
+    
+    const auto *wg_e = wgt + e*D*H;
+    const auto *wu_e = wut + e*D*H;
+    const auto *wd_e = wdt + e*H*M;
+    
+    __shared__ __nv_bfloat16 sh_wg[TD][TH];
+    __shared__ __nv_bfloat16 sh_wu[TD][TH];
+    __shared__ __nv_bfloat16 sh_wd[TH][TM];
+    
+    const __nv_bfloat16 *x_row = nullptr;
+    __nv_bfloat16 *out_row = nullptr;
+    if (active) {
+        x_row = x + ni*D;
+        out_row = out + ni*M;
+    }
+
+    for (int m0=0; m0 < M; m0 += TM) {
+        int vm = min(TM, M - m0);
+
+        float acc[TM];
+        #pragma unroll
+        for (int mm=0; mm < TM; ++mm) {
+            acc[mm]=0.f;
+        }
+        for (int h0=0; h0 < H; h0 += TH) {
+            int vh = min(TH, H - h0);
+            float gf[TH];
+            float uf[TH];
+            #pragma unroll
+            for (int hh=0; hh < TH; ++hh) {
+                gf[hh]=0.f;
+                uf[hh]=0.f;
+            }
+            for (int d0=0; d0 < D; d0 += TD) {
+                int vd = min(TD, D - d0);
+                int num_w_elems = vd * vh;
+                for (int idx = tid; idx < num_w_elems; idx += blockDim.x) {
+                    int dd = idx / vh;
+                    int hh = idx % vh;
+                    sh_wg[dd][hh] = wg_e[(d0 + dd) * H + (h0 + hh)];
+                    sh_wu[dd][hh] = wu_e[(d0 + dd) * H + (h0 + hh)];
+                }
+                __syncthreads();
+
+                if (active) {
+                    #pragma unroll
+                    for (int dd=0; dd < TD; ++dd) {
+                        if (dd >= vd) break;
+                        float xv = __bfloat162float(x_row[d0 + dd]);
+                        #pragma unroll
+                        for (int hh=0; hh < TH; ++hh) {
+                            if (hh >= vh) break;
+                            float wgv = __bfloat162float(sh_wg[dd][hh]);
+                            float wuv = __bfloat162float(sh_wu[dd][hh]);
+                            gf[hh] += xv * wgv;
+                            uf[hh] += xv * wuv;
+                        }
+                    }
+                }
+                __syncthreads();
+            }
+            float act[TH];
+            if (active) {
+                #pragma unroll
+                for (int hh=0; hh < TH; ++hh) {
+                    if (hh >= vh) break;
+                    float g = gf[hh];
+                    float u = uf[hh];
+                    act[hh] = silu(g) * u;
+                }
+            }
+            int num_wd_elems = vh * vm;
+            for (int idx = tid; idx < num_wd_elems; idx += blockDim.x) {
+                int hh = idx / vm;
+                int mm = idx % vm;
+                sh_wd[hh][mm] = wd_e[(h0 + hh) * M + (m0 + mm)];
+            }
+            __syncthreads();
+            if (active) {
+                #pragma unroll
+                for (int hh=0; hh < TH; ++hh) {
+                    if (hh >= vh) break;
+                    float a = act[hh];
+                    #pragma unroll
+                    for (int mm=0; mm < TM; ++mm) {
+                        if (mm >= vm) break;
+                        float w = __bfloat162float(sh_wd[hh][mm]);
+                        acc[mm] += a * w;
                     }
                 }
             }
-            float act[TH];
-            #pragma unroll
-            for (int hh=0; hh < TH; ++hh) {
-                if (hh >= vh) break;
-                act[hh] = silu(gf[hh])*uf[hh];
-            }
-            for (int hh=0; hh < TH; ++hh) {
-                if (hh >= vh) break;
-                float a = act[hh];
-                const auto *wd_row = wd + (h+hh)*M + m;
-                #pragma unroll
-                for (int mm=0; mm < TM; ++mm) {
-                    if (mm >= vm) break;
-                    float w = __bfloat162float(wd_row[mm]);
-                    acc[mm] += a*w;
-                }
-            }
+            __syncthreads();
         }
-        auto *o_row = out + ni*M + m;
-        #pragma unroll
-        for (int mm=0; mm < TM; ++mm) {
-            if (mm >= vm) break;
-            o_row[mm] = __float2bfloat16(acc[mm]);
+
+        if (active) {
+            #pragma unroll
+            for (int mm=0; mm < TM; ++mm) {
+                if (mm >= vm) break;
+                out_row[m0 + mm] = __float2bfloat16(acc[mm]);
+            }
         }
     }
 }
@@ -139,8 +197,13 @@ static __global__ void fused_experts_megakernel(
     TORCH_CHECK(offsets.size(0) == E, "offsets size mismatch");
 
     auto out = torch::zeros({N, M}, x.options());
+
     dim3 block {TN, 1, 1};
-    dim3 grid {static_cast<unsigned>(E), 1};
+    dim3 grid {
+        static_cast<unsigned>(E),
+        static_cast<unsigned>((N+TN-1)/TN),
+        1
+    };
     fused_experts_megakernel<<<grid, block>>>(
         reinterpret_cast<const __nv_bfloat16 *>(x.const_data_ptr<at::BFloat16>()),
         reinterpret_cast<const __nv_bfloat16 *>(wgt.const_data_ptr<at::BFloat16>()),
