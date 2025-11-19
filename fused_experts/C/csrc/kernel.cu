@@ -6,6 +6,9 @@
 
 namespace py = pybind11;
 
+static_assert(sizeof(__nv_bfloat16) == sizeof(at::BFloat16));
+static_assert(alignof(__nv_bfloat16) == alignof(at::BFloat16));
+
 /*
     gate = x @ wgt
     up = x @ wut
@@ -23,12 +26,12 @@ constexpr int TM = 64;
 }
 
 static __global__ void fused_experts_megakernel(
-    const at::BFloat16* __restrict__ x,    // [N, D]
-    const at::BFloat16* __restrict__ wgt,  // [E, D, H]
-    const at::BFloat16* __restrict__ wut,  // [E, D, H]
-    const at::BFloat16* __restrict__ wdt,  // [E, H, M]
-    const int32_t* __restrict__ offsets,    // [E+1]
-    at::BFloat16* __restrict__ out,        // [N, M]
+    const __nv_bfloat16 *__restrict__ x,    // [N, D]
+    const __nv_bfloat16 *__restrict__ wgt,  // [E, D, H]
+    const __nv_bfloat16 *__restrict__ wut,  // [E, D, H]
+    const __nv_bfloat16 *__restrict__ wdt,  // [E, H, M]
+    const int32_t *__restrict__ offsets,    // [E+1]
+    __nv_bfloat16 *__restrict__ out,        // [N, M]
     int E,
     int D,
     int H,
@@ -43,9 +46,9 @@ static __global__ void fused_experts_megakernel(
     int tid = threadIdx.x;
     if (tid >= numel) return;
     int ni = start + tid;
-    const auto* wg = wgt + e*D*H;
-    const auto* wu = wut + e*D*H;
-    const auto* wd = wdt + e*H*M;
+    const auto *wg = wgt + e*D*H;
+    const auto *wu = wut + e*D*H;
+    const auto *wd = wdt + e*H*M;
     for (int m=0; m < M; m += TM) {
         int vm = min(TM, M-m);
         float acc[TM] = {};
@@ -56,11 +59,11 @@ static __global__ void fused_experts_megakernel(
                 int vd = min(TD, D-d);
                 for (int dd=0; dd < TD; ++dd) {
                     if (dd >= vd) break;
-                    float xv = __bfloat162float(static_cast<__nv_bfloat16>(x[ni*D + (d+dd)]));
+                    float xv = __bfloat162float(x[ni*D + (d+dd)]);
                     for (int hh=0; hh < TH; ++hh) {
                         if (hh >= vh) break;
-                        float wgv = __bfloat162float(static_cast<__nv_bfloat16>(wg[(d+dd)*H + (h+hh)]));
-                        float wuv = __bfloat162float(static_cast<__nv_bfloat16>(wu[(d+dd)*H + (h+hh)]));
+                        float wgv = __bfloat162float(wg[(d+dd)*H + (h+hh)]);
+                        float wuv = __bfloat162float(wu[(d+dd)*H + (h+hh)]);
                         gf[hh] += xv*wgv;
                         uf[hh] += xv*wuv;
                     }
@@ -75,30 +78,30 @@ static __global__ void fused_experts_megakernel(
             for (int hh=0; hh < TH; ++hh) {
                 if (hh >= vh) break;
                 float a = act[hh];
-                const auto* wd_row = wd + (h+hh)*M + m;
+                const auto *wd_row = wd + (h+hh)*M + m;
                 #pragma unroll
                 for (int mm=0; mm < TM; ++mm) {
                     if (mm >= vm) break;
-                    float w = __bfloat162float(static_cast<__nv_bfloat16>(wd_row[mm]));
+                    float w = __bfloat162float(wd_row[mm]);
                     acc[mm] += a*w;
                 }
             }
         }
-        auto* o_row = out + ni*M + m;
+        auto *o_row = out + ni*M + m;
         #pragma unroll
         for (int mm=0; mm < TM; ++mm) {
             if (mm >= vm) break;
-            o_row[mm] = static_cast<at::BFloat16>(__float2bfloat16(acc[mm]));
+            o_row[mm] = __float2bfloat16(acc[mm]);
         }
     }
 }
 
 [[nodiscard]] static torch::Tensor fused_experts_kernel(
-    const torch::Tensor& x,
-    const torch::Tensor& wgt,
-    const torch::Tensor& wut,
-    const torch::Tensor& wdt,
-    const torch::Tensor& offsets
+    const torch::Tensor &x,
+    const torch::Tensor &wgt,
+    const torch::Tensor &wut,
+    const torch::Tensor &wdt,
+    const torch::Tensor &offsets
 ) {
     TORCH_CHECK(x.dtype() == at::ScalarType::BFloat16, "x must be BFloat16");
     TORCH_CHECK(wgt.dtype() == at::ScalarType::BFloat16, "wgt must be BFloat16");
@@ -139,12 +142,12 @@ static __global__ void fused_experts_megakernel(
     dim3 block {TN, 1, 1};
     dim3 grid {static_cast<unsigned>(E), 1};
     fused_experts_megakernel<<<grid, block>>>(
-        x.const_data_ptr<at::BFloat16>(),
-        wgt.const_data_ptr<at::BFloat16>(),
-        wut.const_data_ptr<at::BFloat16>(),
-        wdt.const_data_ptr<at::BFloat16>(),
+        reinterpret_cast<const __nv_bfloat16 *>(x.const_data_ptr<at::BFloat16>()),
+        reinterpret_cast<const __nv_bfloat16 *>(wgt.const_data_ptr<at::BFloat16>()),
+        reinterpret_cast<const __nv_bfloat16 *>(wut.const_data_ptr<at::BFloat16>()),
+        reinterpret_cast<const __nv_bfloat16 *>(wdt.const_data_ptr<at::BFloat16>()),
         offsets.const_data_ptr<int32_t>(),
-        out.data_ptr<at::BFloat16>(),
+        reinterpret_cast<__nv_bfloat16 *>(out.data_ptr<at::BFloat16>()),
         static_cast<int>(E),
         static_cast<int>(D),
         static_cast<int>(H),
