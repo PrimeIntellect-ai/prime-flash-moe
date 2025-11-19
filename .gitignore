@@ -5,6 +5,8 @@ __pycache__/
 
 .idea/
 
+benchmark/benchmark.png
+
 # C extensions
 *.so
 

@@ -139,12 +139,12 @@ static __global__ void fused_experts_megakernel(
     dim3 block {TN, 1, 1};
     dim3 grid {static_cast<unsigned>(E), 1};
     fused_experts_megakernel<<<grid, block>>>(
-        reinterpret_cast<const at::BFloat16*>(x.data_ptr<at::BFloat16>()),
-        reinterpret_cast<const at::BFloat16*>(wgt.data_ptr<at::BFloat16>()),
-        reinterpret_cast<const at::BFloat16*>(wut.data_ptr<at::BFloat16>()),
-        reinterpret_cast<const at::BFloat16*>(wdt.data_ptr<at::BFloat16>()),
-        offsets.data_ptr<int32_t>(),
-        reinterpret_cast<at::BFloat16*>(out.data_ptr<at::BFloat16>()),
+        x.const_data_ptr<at::BFloat16>(),
+        wgt.const_data_ptr<at::BFloat16>(),
+        wut.const_data_ptr<at::BFloat16>(),
+        wdt.const_data_ptr<at::BFloat16>(),
+        offsets.const_data_ptr<int32_t>(),
+        out.data_ptr<at::BFloat16>(),
         static_cast<int>(E),
         static_cast<int>(D),
         static_cast<int>(H),
