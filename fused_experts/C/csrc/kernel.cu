@@ -31,6 +31,7 @@ constexpr int TM = 64;
 constexpr int WMMA_M = 16;
 constexpr int WMMA_N = 16;
 constexpr int WMMA_K = 16;
+constexpr int WMMA_TILE = WMMA_M*WMMA_N;
 
 [[nodiscard]] __device__ __forceinline__ static float silu(float x) {
     return x*(1.f/(1.f+__expf(-x)));
@@ -82,7 +83,7 @@ static __global__ void fused_experts_megakernel(
         for (int d0=0; d0 < D; d0 += WMMA_K) {
             wmma_mat_a a_frag;
             wmma_mat_b bg_frag, bu_frag;
-            const __nv_bfloat16 *a_ptr  = x + (globalN0*D + d0);
+            const __nv_bfloat16 *a_ptr = x + (globalN0*D + d0);
             const __nv_bfloat16 *bg_ptr = wg_e + (d0*H + h0);
             const __nv_bfloat16 *bu_ptr = wu_e + (d0*H + h0);
             wmma::load_matrix_sync(a_frag, a_ptr, D);
@@ -104,15 +105,16 @@ static __global__ void fused_experts_megakernel(
         wmma::load_matrix_sync(wd_frag, wd_ptr, M);
         wmma::mma_sync(out_frag, act_frag, wd_frag, out_frag);
     }
-    float out_tile[WMMA_M*WMMA_N];
-    wmma::store_matrix_sync(out_tile, out_frag, WMMA_N, wmma::mem_row_major);
-    for (int mi=lane; mi < WMMA_M*WMMA_N; mi += 32) {
+    __shared__ float sh_out[WMMA_TILE]; // TODO: storing to TLS memory crashes, why is smem required here?
+    wmma::store_matrix_sync(sh_out, out_frag, WMMA_N, wmma::mem_row_major);
+    __syncthreads();
+    for (int mi=lane; mi < WMMA_TILE; mi += 32) {
         int i = mi/WMMA_N;
         int j = mi%WMMA_N;
         int n_idx = globalN0+i;
         int m_idx = tileM+j;
         if (n_idx < endE && n_idx < N && m_idx < M) {
-            out[n_idx * M + m_idx] = __float2bfloat16(out_tile[mi]);
+            out[n_idx*M + m_idx] = __float2bfloat16(sh_out[mi]);
         }
     }
 }
@@ -165,15 +167,17 @@ static __global__ void fused_experts_megakernel(
     TORCH_CHECK(N%WMMA_M == 0, "N must be multiple of 16 for WMMA");
 
     auto offsets_cpu = offsets.to(at::kCPU);
-    const int32_t* off = offsets_cpu.data_ptr<int32_t>();
+    const int32_t *off = offsets_cpu.data_ptr<int32_t>();
 
+    /*
     int32_t prev=0;
-    for (int64_t e=0; e < E; ++e) {
+    for (int64_t e=0; e < E; ++e) { // TODO: for debug only, add masking
         int32_t end = off[e];
         int32_t nE  = end - prev;
         TORCH_CHECK(nE%WMMA_M == 0, "per-expert token count must be multiple of 16 for WMMA (expert ", e, " has ", nE, ")");
         prev = end;
     }
+    */
 
     auto out = torch::zeros({N, M}, x.options());
 

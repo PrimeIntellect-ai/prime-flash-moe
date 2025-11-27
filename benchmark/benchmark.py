@@ -3,7 +3,7 @@ import torch
 import fused_experts as fe
 import matplotlib.pyplot as plt
 
-S=4
+S=2
 N, D = 2048>>S, 2048>>S
 H = 4096>>S
 M = 3072>>S
@@ -30,7 +30,6 @@ wd = torch.rand((E, M, H), device=DEVICE, dtype=DTYPE)
 wgT = wg.transpose(-2, -1).contiguous()  # w Gate
 wuT = wu.transpose(-2, -1).contiguous()  # w Up
 wdT = wd.transpose(-2, -1).contiguous()  # w Down
-
 
 def moe_naive(x, wgT, wuT, wdT, offs) -> torch.Tensor:
     gate_proj = torch._grouped_mm(
