@@ -60,15 +60,15 @@ static __global__ void fused_experts_megakernel(
     int endE = offsets[e];
     int nE = endE-startE;
     if (nE <= 0) return;
-
+    int warp_id = threadIdx.x / 32;
+    int lane  = threadIdx.x & 31;
     int tileN = blockIdx.y*WMMA_M;
-    int tileM = blockIdx.z*WMMA_N;
-
-    if (tileN >= nE || tileM >= M) return;
-
+    if (tileN >= nE) return;
+    int tileM_base = blockIdx.z*WMMA_N*4;
+    int tileM = tileM_base + warp_id*WMMA_N;
     int globalN0 = startE + tileN;
-    if (threadIdx.x >= 32) return; // Single warp for now
-    int lane = threadIdx.x & 31;
+
+    bool warp_active = tileM < M;
 
     const auto *wg_e = wgt + e*D*H;
     const auto *wu_e = wut + e*D*H;
@@ -76,45 +76,51 @@ static __global__ void fused_experts_megakernel(
 
     wmma_acc out_frag;
     wmma::fill_fragment(out_frag, .0f);
-    for (int h0=0; h0 < H; h0 += WMMA_N) {
-        wmma_acc gate_frag, up_frag;
-        wmma::fill_fragment(gate_frag, .0f);
-        wmma::fill_fragment(up_frag, .0f);
-        for (int d0=0; d0 < D; d0 += WMMA_K) {
-            wmma_mat_a a_frag;
-            wmma_mat_b bg_frag, bu_frag;
-            const __nv_bfloat16 *a_ptr = x + (globalN0*D + d0);
-            const __nv_bfloat16 *bg_ptr = wg_e + (d0*H + h0);
-            const __nv_bfloat16 *bu_ptr = wu_e + (d0*H + h0);
-            wmma::load_matrix_sync(a_frag, a_ptr, D);
-            wmma::load_matrix_sync(bg_frag, bg_ptr, H);
-            wmma::load_matrix_sync(bu_frag, bu_ptr, H);
-            wmma::mma_sync(gate_frag, a_frag, bg_frag, gate_frag);
-            wmma::mma_sync(up_frag, a_frag, bu_frag, up_frag);
+    if (warp_active) {
+        for (int h0=0; h0 < H; h0 += WMMA_N) {
+            wmma_acc gate_frag, up_frag;
+            wmma::fill_fragment(gate_frag, .0f);
+            wmma::fill_fragment(up_frag, .0f);
+            for (int d0=0; d0 < D; d0 += WMMA_K) {
+                wmma_mat_a a_frag;
+                wmma_mat_b bg_frag, bu_frag;
+                const __nv_bfloat16 *a_ptr = x + (globalN0*D + d0);
+                const __nv_bfloat16 *bg_ptr = wg_e + (d0*H + h0);
+                const __nv_bfloat16 *bu_ptr = wu_e + (d0*H + h0);
+                wmma::load_matrix_sync(a_frag, a_ptr, D);
+                wmma::load_matrix_sync(bg_frag, bg_ptr, H);
+                wmma::load_matrix_sync(bu_frag, bu_ptr, H);
+                wmma::mma_sync(gate_frag, a_frag, bg_frag, gate_frag);
+                wmma::mma_sync(up_frag, a_frag, bu_frag, up_frag);
+            }
+            wmma_mat_a act_frag;
+            #pragma unroll
+            for (int i=0; i < gate_frag.num_elements; ++i) {
+                float g = gate_frag.x[i];
+                float u = up_frag.x[i];
+                float a = silu(g)*u;
+                act_frag.x[i] = __float2bfloat16(a);
+            }
+            wmma_mat_b wd_frag;
+            const auto *wd_ptr = wd_e + (h0*M + tileM);
+            wmma::load_matrix_sync(wd_frag, wd_ptr, M);
+            wmma::mma_sync(out_frag, act_frag, wd_frag, out_frag);
         }
-        wmma_mat_a act_frag;
-        #pragma unroll
-        for (int i=0; i < gate_frag.num_elements; ++i) {
-            float g = gate_frag.x[i];
-            float u = up_frag.x[i];
-            float a = silu(g)*u;
-            act_frag.x[i] = __float2bfloat16(a);
-        }
-        wmma_mat_b wd_frag;
-        const auto *wd_ptr = wd_e + (h0*M + tileM);
-        wmma::load_matrix_sync(wd_frag, wd_ptr, M);
-        wmma::mma_sync(out_frag, act_frag, wd_frag, out_frag);
     }
-    __shared__ float sh_out[WMMA_TILE]; // TODO: storing to TLS memory crashes, why is smem required here?
-    wmma::store_matrix_sync(sh_out, out_frag, WMMA_N, wmma::mem_row_major);
+    __shared__ float sh_out[4][WMMA_TILE];
+    auto *sho = sh_out[warp_id];
+    if (warp_active)
+        wmma::store_matrix_sync(sho, out_frag, WMMA_N, wmma::mem_row_major);
     __syncthreads();
-    for (int mi=lane; mi < WMMA_TILE; mi += 32) {
-        int i = mi/WMMA_N;
-        int j = mi%WMMA_N;
-        int n_idx = globalN0+i;
-        int m_idx = tileM+j;
-        if (n_idx < endE && n_idx < N && m_idx < M) {
-            out[n_idx*M + m_idx] = __float2bfloat16(sh_out[mi]);
+    if (warp_active) {
+        for (int mi = lane; mi < WMMA_TILE; mi += 32) {
+            int i = mi / WMMA_N;
+            int j = mi % WMMA_N;
+            int n_idx = globalN0 + i;
+            int m_idx = tileM    + j;
+            if (n_idx < endE && n_idx < N && m_idx < M) {
+                out[n_idx * M + m_idx] = __float2bfloat16(sho[mi]);
+            }
         }
     }
 }
@@ -181,12 +187,12 @@ static __global__ void fused_experts_megakernel(
 
     auto out = torch::zeros({N, M}, x.options());
 
-    dim3 block {32, 1, 1}; // 1 warp per block
-    dim3 grid {
-        static_cast<unsigned>(E),
-        static_cast<unsigned>((N + WMMA_M - 1)/WMMA_M),
-        static_cast<unsigned>((M + WMMA_N - 1)/WMMA_N)
-    };
+    dim3 block(128, 1, 1); // 4 warps
+    dim3 grid(
+        E,
+        (N + WMMA_M-1) / WMMA_M,
+        (M + (WMMA_N*4) - 1) / (WMMA_N*4)
+    );
     fused_experts_megakernel<<<grid, block>>>(
         reinterpret_cast<const __nv_bfloat16 *>(x.const_data_ptr<at::BFloat16>()),
         reinterpret_cast<const __nv_bfloat16 *>(wgt.const_data_ptr<at::BFloat16>()),

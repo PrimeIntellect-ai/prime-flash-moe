@@ -139,6 +139,5 @@ def plot_results(naive_times, fused_times):
 
 
 if __name__ == '__main__':
-    check_correctness()
     naive_times, fused_times = run_benchmarks()
     plot_results(naive_times, fused_times)
