@@ -4,10 +4,17 @@
 #include <cutlass/gemm/device/gemm.h>
 #include <cutlass/numeric_types.h>
 
+#include <mma.h>
+using namespace nvcuda;
+
 namespace py = pybind11;
 
 static_assert(sizeof(__nv_bfloat16) == sizeof(at::BFloat16));
 static_assert(alignof(__nv_bfloat16) == alignof(at::BFloat16));
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+#error "CUDA too old, BF16 WMMA requires a recent CUDA version"
+#endif
 
 /*
     gate = x @ wgt
@@ -21,9 +28,17 @@ constexpr int TH = 32;
 constexpr int TD = 32;
 constexpr int TM = 64;
 
+constexpr int WMMA_M = 16;
+constexpr int WMMA_N = 16;
+constexpr int WMMA_K = 16;
+
 [[nodiscard]] __device__ __forceinline__ static float silu(float x) {
     return x*(1.f/(1.f+__expf(-x)));
 }
+
+using wmma_acc = wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float>;
+using wmma_mat_a = wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, wmma::row_major>;
+using wmma_mat_b = wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, wmma::row_major>;
 
 static __global__ void fused_experts_megakernel(
     const __nv_bfloat16 *__restrict__ x,    // [N, D]
@@ -44,112 +59,60 @@ static __global__ void fused_experts_megakernel(
     int endE = offsets[e];
     int nE = endE-startE;
     if (nE <= 0) return;
-    int tileStart = blockIdx.y*blockDim.x;
-    int tileEnd = tileStart+blockDim.x;
-    if (tileStart >= endE || tileEnd <= startE) return;
-    int tid = threadIdx.x;
-    int ni = tileStart + tid;
-    bool active = ni >= startE && ni < endE;
-    
+
+    int tileN = blockIdx.y*WMMA_M;
+    int tileM = blockIdx.z*WMMA_N;
+
+    if (tileN >= nE || tileM >= M) return;
+
+    int globalN0 = startE + tileN;
+    if (threadIdx.x >= 32) return; // Single warp for now
+    int lane = threadIdx.x & 31;
+
     const auto *wg_e = wgt + e*D*H;
     const auto *wu_e = wut + e*D*H;
     const auto *wd_e = wdt + e*H*M;
-    
-    __shared__ __nv_bfloat16 sh_wg[TD][TH];
-    __shared__ __nv_bfloat16 sh_wu[TD][TH];
-    __shared__ __nv_bfloat16 sh_wd[TH][TM];
-    
-    const __nv_bfloat16 *x_row = nullptr;
-    __nv_bfloat16 *out_row = nullptr;
-    if (active) {
-        x_row = x + ni*D;
-        out_row = out + ni*M;
-    }
 
-    for (int m0=0; m0 < M; m0 += TM) {
-        int vm = min(TM, M - m0);
-
-        float acc[TM];
+    wmma_acc out_frag;
+    wmma::fill_fragment(out_frag, .0f);
+    for (int h0=0; h0 < H; h0 += WMMA_N) {
+        wmma_acc gate_frag, up_frag;
+        wmma::fill_fragment(gate_frag, .0f);
+        wmma::fill_fragment(up_frag, .0f);
+        for (int d0=0; d0 < D; d0 += WMMA_K) {
+            wmma_mat_a a_frag;
+            wmma_mat_b bg_frag, bu_frag;
+            const __nv_bfloat16 *a_ptr  = x + (globalN0*D + d0);
+            const __nv_bfloat16 *bg_ptr = wg_e + (d0*H + h0);
+            const __nv_bfloat16 *bu_ptr = wu_e + (d0*H + h0);
+            wmma::load_matrix_sync(a_frag, a_ptr, D);
+            wmma::load_matrix_sync(bg_frag, bg_ptr, H);
+            wmma::load_matrix_sync(bu_frag, bu_ptr, H);
+            wmma::mma_sync(gate_frag, a_frag, bg_frag, gate_frag);
+            wmma::mma_sync(up_frag, a_frag, bu_frag, up_frag);
+        }
+        wmma_mat_a act_frag;
         #pragma unroll
-        for (int mm=0; mm < TM; ++mm) {
-            acc[mm]=0.f;
+        for (int i=0; i < gate_frag.num_elements; ++i) {
+            float g = gate_frag.x[i];
+            float u = up_frag.x[i];
+            float a = silu(g)*u;
+            act_frag.x[i] = __float2bfloat16(a);
         }
-        for (int h0=0; h0 < H; h0 += TH) {
-            int vh = min(TH, H - h0);
-            float gf[TH];
-            float uf[TH];
-            #pragma unroll
-            for (int hh=0; hh < TH; ++hh) {
-                gf[hh]=0.f;
-                uf[hh]=0.f;
-            }
-            for (int d0=0; d0 < D; d0 += TD) {
-                int vd = min(TD, D - d0);
-                int num_w_elems = vd * vh;
-                for (int idx = tid; idx < num_w_elems; idx += blockDim.x) {
-                    int dd = idx / vh;
-                    int hh = idx % vh;
-                    sh_wg[dd][hh] = wg_e[(d0 + dd) * H + (h0 + hh)];
-                    sh_wu[dd][hh] = wu_e[(d0 + dd) * H + (h0 + hh)];
-                }
-                __syncthreads();
-
-                if (active) {
-                    #pragma unroll
-                    for (int dd=0; dd < TD; ++dd) {
-                        if (dd >= vd) break;
-                        float xv = __bfloat162float(x_row[d0 + dd]);
-                        #pragma unroll
-                        for (int hh=0; hh < TH; ++hh) {
-                            if (hh >= vh) break;
-                            float wgv = __bfloat162float(sh_wg[dd][hh]);
-                            float wuv = __bfloat162float(sh_wu[dd][hh]);
-                            gf[hh] += xv * wgv;
-                            uf[hh] += xv * wuv;
-                        }
-                    }
-                }
-                __syncthreads();
-            }
-            float act[TH];
-            if (active) {
-                #pragma unroll
-                for (int hh=0; hh < TH; ++hh) {
-                    if (hh >= vh) break;
-                    float g = gf[hh];
-                    float u = uf[hh];
-                    act[hh] = silu(g) * u;
-                }
-            }
-            int num_wd_elems = vh * vm;
-            for (int idx = tid; idx < num_wd_elems; idx += blockDim.x) {
-                int hh = idx / vm;
-                int mm = idx % vm;
-                sh_wd[hh][mm] = wd_e[(h0 + hh) * M + (m0 + mm)];
-            }
-            __syncthreads();
-            if (active) {
-                #pragma unroll
-                for (int hh=0; hh < TH; ++hh) {
-                    if (hh >= vh) break;
-                    float a = act[hh];
-                    #pragma unroll
-                    for (int mm=0; mm < TM; ++mm) {
-                        if (mm >= vm) break;
-                        float w = __bfloat162float(sh_wd[hh][mm]);
-                        acc[mm] += a * w;
-                    }
-                }
-            }
-            __syncthreads();
-        }
-
-        if (active) {
-            #pragma unroll
-            for (int mm=0; mm < TM; ++mm) {
-                if (mm >= vm) break;
-                out_row[m0 + mm] = __float2bfloat16(acc[mm]);
-            }
+        wmma_mat_b wd_frag;
+        const auto *wd_ptr = wd_e + (h0*M + tileM);
+        wmma::load_matrix_sync(wd_frag, wd_ptr, M);
+        wmma::mma_sync(out_frag, act_frag, wd_frag, out_frag);
+    }
+    float out_tile[WMMA_M*WMMA_N];
+    wmma::store_matrix_sync(out_tile, out_frag, WMMA_N, wmma::mem_row_major);
+    for (int mi=lane; mi < WMMA_M*WMMA_N; mi += 32) {
+        int i = mi/WMMA_N;
+        int j = mi%WMMA_N;
+        int n_idx = globalN0+i;
+        int m_idx = tileM+j;
+        if (n_idx < endE && n_idx < N && m_idx < M) {
+            out[n_idx * M + m_idx] = __float2bfloat16(out_tile[mi]);
         }
     }
 }
@@ -196,13 +159,29 @@ static __global__ void fused_experts_megakernel(
     TORCH_CHECK(wdt.size(1) == H, "wdt size mismatch");
     TORCH_CHECK(offsets.size(0) == E, "offsets size mismatch");
 
+    TORCH_CHECK(D%WMMA_K == 0, "D must be multiple of 16 for WMMA");
+    TORCH_CHECK(H%WMMA_N == 0, "H must be multiple of 16 for WMMA");
+    TORCH_CHECK(M%WMMA_N == 0, "M must be multiple of 16 for WMMA");
+    TORCH_CHECK(N%WMMA_M == 0, "N must be multiple of 16 for WMMA");
+
+    auto offsets_cpu = offsets.to(at::kCPU);
+    const int32_t* off = offsets_cpu.data_ptr<int32_t>();
+
+    int32_t prev=0;
+    for (int64_t e=0; e < E; ++e) {
+        int32_t end = off[e];
+        int32_t nE  = end - prev;
+        TORCH_CHECK(nE%WMMA_M == 0, "per-expert token count must be multiple of 16 for WMMA (expert ", e, " has ", nE, ")");
+        prev = end;
+    }
+
     auto out = torch::zeros({N, M}, x.options());
 
-    dim3 block {TN, 1, 1};
+    dim3 block {32, 1, 1}; // 1 warp per block
     dim3 grid {
         static_cast<unsigned>(E),
-        static_cast<unsigned>((N+TN-1)/TN),
-        1
+        static_cast<unsigned>((N + WMMA_M - 1)/WMMA_M),
+        static_cast<unsigned>((M + WMMA_N - 1)/WMMA_N)
     };
     fused_experts_megakernel<<<grid, block>>>(
         reinterpret_cast<const __nv_bfloat16 *>(x.const_data_ptr<at::BFloat16>()),
