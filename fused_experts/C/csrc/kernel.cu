@@ -19,7 +19,7 @@ static_assert(alignof(__nv_bfloat16) == alignof(at::BFloat16));
 /*
     gate = x @ wgt
     up = x @ wut
-    act = silu(gate) * up
+    act = silu(gate)*up
     out = act @ wdt
 */
 
@@ -46,7 +46,7 @@ static __global__ void fused_experts_megakernel(
     const __nv_bfloat16 *__restrict__ wgt,  // [E, D, H]
     const __nv_bfloat16 *__restrict__ wut,  // [E, D, H]
     const __nv_bfloat16 *__restrict__ wdt,  // [E, H, M]
-    const int32_t *__restrict__ offsets,    // [E+1]
+    const int32_t *__restrict__ offsets,    // [E]
     __nv_bfloat16 *__restrict__ out,        // [N, M]
     int E,
     int D,
@@ -58,68 +58,75 @@ static __global__ void fused_experts_megakernel(
     if (e >= E) return;
     int startE = !e ? 0 : offsets[e-1];
     int endE = offsets[e];
-    int nE = endE-startE;
+    int nE = endE - startE;
     if (nE <= 0) return;
-    int warp_id = threadIdx.x / 32;
-    int lane  = threadIdx.x & 31;
+    int warp_id = threadIdx.x>>5;
+    int lane = threadIdx.x&31;
     int tileN = blockIdx.y*WMMA_M;
     if (tileN >= nE) return;
-    int tileM_base = blockIdx.z*WMMA_N*4;
-    int tileM = tileM_base + warp_id*WMMA_N;
     int globalN0 = startE + tileN;
+    int tileM_base = blockIdx.z*WMMA_N*4;
+    if (tileM_base >= M) return;
+    int tileM = tileM_base + warp_id*WMMA_N;
+    bool warp_active = (tileM < M);
 
-    bool warp_active = tileM < M;
+    const auto *wg_e = wgt + e*D*H; // [D, H]
+    const auto *wu_e = wut + e*D*H; // [D, H]
+    const auto *wd_e = wdt + e*H*M; // [H, M]
 
-    const auto *wg_e = wgt + e*D*H;
-    const auto *wu_e = wut + e*D*H;
-    const auto *wd_e = wdt + e*H*M;
+    __shared__ float sh_gate[WMMA_TILE];
+    __shared__ float sh_up[WMMA_TILE];
+    __shared__ __nv_bfloat16 sh_act[WMMA_TILE];
+    __shared__ float sh_out[4][WMMA_TILE];
 
     wmma_acc out_frag;
-    wmma::fill_fragment(out_frag, .0f);
-    if (warp_active) {
-        for (int h0=0; h0 < H; h0 += WMMA_N) {
+    wmma::fill_fragment(out_frag, 0.0f);
+
+    for (int h0=0; h0 < H; h0 += WMMA_N) {
+        if (warp_id == 0) {
             wmma_acc gate_frag, up_frag;
-            wmma::fill_fragment(gate_frag, .0f);
-            wmma::fill_fragment(up_frag, .0f);
+            wmma::fill_fragment(gate_frag, 0.0f);
+            wmma::fill_fragment(up_frag,   0.0f);
             for (int d0=0; d0 < D; d0 += WMMA_K) {
                 wmma_mat_a a_frag;
                 wmma_mat_b bg_frag, bu_frag;
-                const __nv_bfloat16 *a_ptr = x + (globalN0*D + d0);
-                const __nv_bfloat16 *bg_ptr = wg_e + (d0*H + h0);
-                const __nv_bfloat16 *bu_ptr = wu_e + (d0*H + h0);
-                wmma::load_matrix_sync(a_frag, a_ptr, D);
+                const auto *a_ptr  = x + (globalN0*D + d0);
+                const auto *bg_ptr = wg_e + (d0*H + h0);
+                const auto *bu_ptr = wu_e + (d0*H + h0);
+                wmma::load_matrix_sync(a_frag,  a_ptr,  D);
                 wmma::load_matrix_sync(bg_frag, bg_ptr, H);
                 wmma::load_matrix_sync(bu_frag, bu_ptr, H);
                 wmma::mma_sync(gate_frag, a_frag, bg_frag, gate_frag);
-                wmma::mma_sync(up_frag, a_frag, bu_frag, up_frag);
+                wmma::mma_sync(up_frag,   a_frag, bu_frag, up_frag);
             }
+            wmma::store_matrix_sync(sh_gate, gate_frag, WMMA_N, wmma::mem_row_major);
+            wmma::store_matrix_sync(sh_up,   up_frag,   WMMA_N, wmma::mem_row_major);
+            for (int i=lane; i < WMMA_TILE; i += 32)
+                sh_act[i] = __float2bfloat16(silu(sh_gate[i])*sh_up[i]);
+        }
+        __syncthreads();
+        if (warp_active) {
             wmma_mat_a act_frag;
-            #pragma unroll
-            for (int i=0; i < gate_frag.num_elements; ++i) {
-                float g = gate_frag.x[i];
-                float u = up_frag.x[i];
-                float a = silu(g)*u;
-                act_frag.x[i] = __float2bfloat16(a);
-            }
             wmma_mat_b wd_frag;
-            const auto *wd_ptr = wd_e + (h0*M + tileM);
+            wmma::load_matrix_sync(act_frag, sh_act, WMMA_N);
+            const __nv_bfloat16 *wd_ptr = wd_e + (h0*M + tileM);
             wmma::load_matrix_sync(wd_frag, wd_ptr, M);
             wmma::mma_sync(out_frag, act_frag, wd_frag, out_frag);
         }
+        __syncthreads();
     }
-    __shared__ float sh_out[4][WMMA_TILE];
     auto *sho = sh_out[warp_id];
     if (warp_active)
         wmma::store_matrix_sync(sho, out_frag, WMMA_N, wmma::mem_row_major);
     __syncthreads();
     if (warp_active) {
-        for (int mi = lane; mi < WMMA_TILE; mi += 32) {
-            int i = mi / WMMA_N;
-            int j = mi % WMMA_N;
+        for (int mi=lane; mi < WMMA_TILE; mi += 32) {
+            int i = mi/WMMA_N;
+            int j = mi%WMMA_N;
             int n_idx = globalN0 + i;
-            int m_idx = tileM    + j;
+            int m_idx = tileM + j;
             if (n_idx < endE && n_idx < N && m_idx < M) {
-                out[n_idx * M + m_idx] = __float2bfloat16(sho[mi]);
+                out[n_idx*M + m_idx] = __float2bfloat16(sho[mi]);
             }
         }
     }
@@ -172,10 +179,10 @@ static __global__ void fused_experts_megakernel(
     TORCH_CHECK(M%WMMA_N == 0, "M must be multiple of 16 for WMMA");
     TORCH_CHECK(N%WMMA_M == 0, "N must be multiple of 16 for WMMA");
 
+#if 0
     auto offsets_cpu = offsets.to(at::kCPU);
     const int32_t *off = offsets_cpu.data_ptr<int32_t>();
 
-    /*
     int32_t prev=0;
     for (int64_t e=0; e < E; ++e) { // TODO: for debug only, add masking
         int32_t end = off[e];
@@ -183,11 +190,11 @@ static __global__ void fused_experts_megakernel(
         TORCH_CHECK(nE%WMMA_M == 0, "per-expert token count must be multiple of 16 for WMMA (expert ", e, " has ", nE, ")");
         prev = end;
     }
-    */
+#endif
 
     auto out = torch::zeros({N, M}, x.options());
 
-    dim3 block(128, 1, 1); // 4 warps
+    dim3 block(32*4, 1, 1); // 4 warps
     dim3 grid(
         E,
         (N + WMMA_M-1) / WMMA_M,

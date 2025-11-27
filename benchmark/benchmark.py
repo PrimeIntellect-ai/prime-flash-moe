@@ -3,7 +3,7 @@ import torch
 import fused_experts as fe
 import matplotlib.pyplot as plt
 
-S=2
+S=3
 N, D = 2048>>S, 2048>>S
 H = 4096>>S
 M = 3072>>S
