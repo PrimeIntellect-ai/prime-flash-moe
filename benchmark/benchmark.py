@@ -3,11 +3,18 @@ import torch
 import fused_experts as fe
 import matplotlib.pyplot as plt
 
-S=3
-N, D = 2048>>S, 2048>>S
-H = 4096>>S
-M = 3072>>S
-E = 16>>S
+REDUCE = 3 # log2 reduction shift to run the same scale on my RTX 5000 series GPU but with smaller quantities
+LBS = 6
+SEQLEN = 8192>>REDUCE
+HIDDEN_DIM = 3072>>REDUCE
+EXPERT_DIM = 3072>>REDUCE
+NUM_LOCAL_EXPERTS = 32>>REDUCE
+
+N = LBS*SEQLEN              # 49152 tokens per GPU
+D = HIDDEN_DIM              # input hidden size
+H = EXPERT_DIM              # expert inner dim
+M = HIDDEN_DIM              # output hidden size
+E = NUM_LOCAL_EXPERTS       # number of local experts
 
 DEVICE = 'cuda'
 DTYPE = torch.bfloat16
