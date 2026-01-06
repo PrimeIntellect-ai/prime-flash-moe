@@ -4,6 +4,8 @@
 #include <cutlass/gemm/device/gemm.h>
 #include <cutlass/numeric_types.h>
 
+#include "common.cuh"
+
 #include <mma.h>
 using namespace nvcuda;
 
