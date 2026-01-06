@@ -66,7 +66,7 @@ namespace pi {
         }
 
         __device__ __forceinline__ void commit_group() {
-            asm volatile("cp.async.commit_group;\n" :::);
+            asm volatile("cp.async.commit_group;\n" ::: "memory");
         }
 
         __device__ __forceinline__ void await_group(int n) {
