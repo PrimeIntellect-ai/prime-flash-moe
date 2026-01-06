@@ -4,7 +4,7 @@
 
 namespace pi {
     [[nodiscard]] constexpr __device__ __forceinline__ int32_t const_ceil(float x) {
-        return (static_cast<float>(static_cast<int32_t>(x)) == x) ? static_cast<int32_t>(x) : static_cast<int32_t>(x) + ((num > 0) ? 1 : 0);
+        return (static_cast<float>(static_cast<int32_t>(x)) == x) ? static_cast<int32_t>(x) : static_cast<int32_t>(x) + (x > 0);
     }
 
     [[nodiscard]] constexpr __device__ __forceinline__ uint64_t matrix_desc_encode(uint64_t x) {
@@ -14,7 +14,7 @@ namespace pi {
     template <const uint32_t bits, const uint32_t base=4, const uint32_t shift=3>
     [[nodiscard]] constexpr __device__ __forceinline__ int32_t swizzle(int32_t i) {
         if constexpr (!bits) return i;
-        static constexpr uint32_t mask = ((1u<<bits)-1)<<(base+shift);
+        constexpr uint32_t mask = ((1u<<bits)-1)<<(base+shift);
         return i^((i&mask)>>shift);
     }
 
@@ -39,7 +39,7 @@ namespace pi {
         }
 
         __device__ __forceinline__ void await() {
-            asm volatile ("wgmma.wait_group.sync.aligned 0;\n" ::: memory);
+            asm volatile ("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
         }
     }
 }

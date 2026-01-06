@@ -13,6 +13,8 @@ if os.environ.get('DEBUG'):
 else:
     extra_compile_args = ['-O3']
 
+extra_compile_args.append('-std=c++17')
+
 extra_link_args: list[str] = []
 
 CUTLASS = ROOT / 'extern' / 'cutlass'
