@@ -29,7 +29,7 @@ namespace pi {
         return w*(x/(1.f+__expf(-x)));
     }
 
-    namespace warpgroup {
+    namespace warp_group {
         __device__ __forceinline__ void arrive() {
             asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
         }
@@ -40,6 +40,37 @@ namespace pi {
 
         __device__ __forceinline__ void await() {
             asm volatile ("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
+        }
+    }
+
+    namespace cp_async {
+        __device__ __forceinline__ void load(void *dst, const void *tma_map, uint64_t *bar, int row, int col) {
+            static_assert(sizeof(void *) == sizeof(uint64_t));
+            auto ptma = reinterpret_cast<uint64_t>(tma_map);
+            auto pmbar = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
+            auto pdst = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
+            asm volatile(
+                "cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes [%0] [%1, {%3, %4}], [%2];\n"
+                :
+                : "r"(pdst), "l"(ptma), "r"(pmbar), "r"(row), "r"(col)
+                : "memory"
+            );
+        }
+
+        __device__ __forceinline__ void cg256(void *dst, const void *src, int nb) {
+            asm volatile("cp.async.cg.shared.global.L2::256B [%0], [%1], %2;\n" :: "r"(dst), "l"(src), "n"(nb));
+        }
+
+        __device__ __forceinline__ void cg64(void *dst, const void *src, int nb) {
+            asm volatile("cp.async.cg.shared.global.L2::64B [%0], [%1], %2;\n" :: "r"(dst), "l"(src), "n"(nb));
+        }
+
+        __device__ __forceinline__ void commit_group() {
+            asm volatile("cp.async.commit_group;\n" :::);
+        }
+
+        __device__ __forceinline__ void await_group(int n) {
+            asm volatile("cp.async.wait_group %0;\n" :: "n"(n));
         }
     }
 }
