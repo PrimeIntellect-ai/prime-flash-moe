@@ -131,5 +131,67 @@ namespace pi {
             );
         }
     }
+
+    namespace ls_matrix {
+         __device__ __forceinline__ void load1(uint32_t *tile, uint32_t mat) {
+            asm volatile(
+                "ldmatrix.sync.aligned.m8n8.x1.shared.b16 {%0}, [%1];\n"
+                : "=r"(tile[0]) : "r"(mat)
+            );
+        }
+
+        __device__ __forceinline__ void load2(uint32_t *tile, uint32_t mat) {
+            asm volatile(
+                "ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
+                : "=r"(tile[0]), "=r"(tile[1]) : "r"(mat)
+            );
+        }
+
+        __device__ __forceinline__ void load4(uint32_t *tile, uint32_t mat) {
+            asm volatile(
+                "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                : "=r"(tile[0]), "=r"(tile[1]), "=r"(tile[2]), "=r"(tile[3]) : "r"(mat)
+            );
+        }
+
+        template <const bool T>
+        __device__ __forceinline__ void store1(uint32_t *tile, uint32_t mat) {
+            if constexpr (T) asm volatile(
+                "stmatrix.sync.aligned.m8n8.x1.shared.b16 [%0], {%1};\n"
+                :: "r"(mat), "r"(tile[0])
+                : "memory"
+            ); else asm volatile(
+                "stmatrix.sync.aligned.m8n8.x1.trans.shared.b16 [%0], {%1};\n"
+                :: "r"(mat), "r"(tile[0])
+                : "memory"
+            );
+        }
+
+        template <const bool T>
+        __device__ __forceinline__ void store2(uint32_t *tile, uint32_t mat) {
+            if constexpr (T) asm volatile(
+                "stmatrix.sync.aligned.m8n8.x2.shared.b16 [%0], {%1 %2};\n"
+                :: "r"(mat), "r"(tile[0]), "r"(tile[1])
+                : "memory"
+            ); else asm volatile(
+                "stmatrix.sync.aligned.m8n8.x2.trans.shared.b16 [%0], {%1 %2};\n"
+                :: "r"(mat), "r"(tile[0]), "r"(tile[1])
+                : "memory"
+            );
+        }
+
+        template <const bool T>
+        __device__ __forceinline__ void store4(uint32_t *tile, uint32_t mat) {
+            if constexpr (T) asm volatile(
+                "stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1 %2 %3 %4};\n"
+                :: "r"(mat), "r"(tile[0]), "r"(tile[1]), "r"(tile[2]), "r"(tile[3])
+                : "memory"
+            ); else asm volatile(
+                "stmatrix.sync.aligned.m8n8.x4.trans.shared.b16 [%0], {%1 %2 %3 %4};\n"
+                :: "r"(mat), "r"(tile[0]), "r"(tile[1]), "r"(tile[2]), "r"(tile[3])
+                : "memory"
+            );
+        }
+    }
 }
 
