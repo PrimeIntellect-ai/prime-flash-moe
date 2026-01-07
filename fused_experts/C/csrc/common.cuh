@@ -29,6 +29,18 @@ namespace pi {
         return w*(x/(1.f+__expf(-x)));
     }
 
+    namespace reg_alloc {
+        template <const uint32_t regs>
+        __device__ __forceinline__ void alloc() {
+            asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" :: "n"(regs));
+        }
+
+        template <const uint32_t regs>
+        __device__ __forceinline__ void dealloc() {
+            asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" :: "n"(regs));
+        }
+    }
+
     namespace warp_group {
         __device__ __forceinline__ void arrive() {
             asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
@@ -74,6 +86,49 @@ namespace pi {
         template <const int n>
         __device__ __forceinline__ void await_group() {
             asm volatile("cp.async.wait_group %0;\n" :: "n"(n));
+        }
+    }
+
+    namespace barrier {
+        __device__ __forceinline__ void init(uint64_t *bar, int threads, int transactions) {
+            asm volatile(
+                "mbarrier.init.shared::cta.b64 [%0], %1;\n"
+                :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(bar))), "r"(threads+transactions)
+            );
+        }
+
+        __device__ __forceinline__ void arrive_cp_async_mem(uint64_t *bar) {
+            asm volatile(
+                "cp.async.mbarrier.arrive.noinc.shared.b64 [%0];\n"
+                :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(bar)))
+            );
+        }
+
+        __device__ __forceinline__ void arrive(uint64_t *bar, uint32_t num=1) {
+            asm volatile(
+                "mbarrier.arrive.shared.b64 _, [%0], %1;\n"
+                :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(bar))), "r"(num)
+                : "memory"
+            );
+        }
+
+        __device__ __forceinline__ void expect_nb(uint64_t *bar, uint32_t nb) {
+            asm volatile(
+                "mbarrier.arrive.expect_tx.release.cta.shared::ctx.b64 _, [%0], %1;\n"
+                :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(bar))), "r"(nb)
+            );
+        }
+
+        __device__ __forceinline__ void await(uint64_t *bar, int phase) {
+            asm volatile(
+                "{\n"
+                ".reg .pred P1;\n"
+                "AWAIT:\n"
+                "mbarrier.try_wait.parity.shared.b64 P1, [%0], %1;\n"
+                "@!P1 bra.uni AWAIT;\n"
+                "}\n"
+                :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(bar))), "r"(phase)
+            );
         }
     }
 }
