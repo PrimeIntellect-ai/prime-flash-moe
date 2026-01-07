@@ -57,11 +57,13 @@ namespace pi {
             );
         }
 
-        __device__ __forceinline__ void cg256(void *dst, const void *src, int nb) {
+        template <const int nb>
+        __device__ __forceinline__ void cg256(void *dst, const void *src) {
             asm volatile("cp.async.cg.shared.global.L2::256B [%0], [%1], %2;\n" :: "r"(dst), "l"(src), "n"(nb));
         }
 
-        __device__ __forceinline__ void cg64(void *dst, const void *src, int nb) {
+        template <const int nb>
+        __device__ __forceinline__ void cg64(void *dst, const void *src) {
             asm volatile("cp.async.cg.shared.global.L2::64B [%0], [%1], %2;\n" :: "r"(dst), "l"(src), "n"(nb));
         }
 
@@ -69,7 +71,8 @@ namespace pi {
             asm volatile("cp.async.commit_group;\n" ::: "memory");
         }
 
-        __device__ __forceinline__ void await_group(int n) {
+        template <const int n>
+        __device__ __forceinline__ void await_group() {
             asm volatile("cp.async.wait_group %0;\n" :: "n"(n));
         }
     }
