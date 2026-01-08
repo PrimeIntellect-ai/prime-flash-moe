@@ -7,10 +7,6 @@ namespace pi {
         return (static_cast<float>(static_cast<int32_t>(x)) == x) ? static_cast<int32_t>(x) : static_cast<int32_t>(x) + (x > 0);
     }
 
-    [[nodiscard]] constexpr __device__ __forceinline__ uint64_t matrix_desc_encode(uint64_t x) {
-        return (x & 0x3ffff)>>4;
-    }
-
     template <const uint32_t bits, const uint32_t base=4, const uint32_t shift=3>
     [[nodiscard]] constexpr __device__ __forceinline__ int32_t swizzle(int32_t i) {
         if constexpr (!bits) return i;
@@ -20,13 +16,409 @@ namespace pi {
 
     template <const uint64_t sdo, const uint64_t ldo, uint64_t mode>
     [[nodiscard]] __device__ __forceinline__ uint64_t smem_desc_encode(void *p) {
-        auto addr = static_cast<uint32_t>(__cvta_generic_to_shared(p));
-        uint64_t desc = (static_cast<uint64_t>(addr) & 0x3ffff)>>4;
-        return desc | (ldo<<16) | (sdo<<32) | (mode<<62);
+        return ((static_cast<uint64_t>(__cvta_generic_to_shared(p)) & 0x3ffff)>>4) | (ldo<<16) | (sdo<<32) | (mode<<62);
     }
 
-    [[nodiscard]] __device__ __forceinline__ float swiglu(float x, float w) {
-        return w*(x/(1.f+__expf(-x)));
+   namespace wgmma {
+        template <const int scale_d, const int scale_a, const int scale_b>
+        __device__ __forceinline__ void mm8(float r[1][4], uint64_t desc_a, uint64_t desc_b) {
+            asm volatile(
+                "{\n"
+                "wgmma.mma_async.sync.aligned.m64n8k32.f32.bf16.bf16 {%0, %1, %2, %3}, %4, %5, %6, %7, %8;\n"
+                "}\n"
+                : "+f"(r[0][0]), "+f"(r[0][1]), "+f"(r[0][2]), "+f"(r[0][3])
+                : "l"(desc_a), "l"(desc_b), "n"(scale_d), "n"(scale_a), "n"(scale_b)
+            );
+        }
+
+        template <const int scale_d, const int scale_a, const int scale_b>
+        __device__ __forceinline__ void mm16(float r[2][4], uint64_t desc_a, uint64_t desc_b) {
+            asm volatile(
+                "{\n"
+                "wgmma.mma_async.sync.aligned.m64n16k32.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7}, %8, %9, %10, %11, %12;\n"
+                "}\n"
+                : "+f"(r[0][0]), "+f"(r[0][1]), "+f"(r[0][2]), "+f"(r[0][3]),
+                  "+f"(r[1][0]), "+f"(r[1][1]), "+f"(r[1][2]), "+f"(r[1][3])
+                : "l"(desc_a), "l"(desc_b), "n"(scale_d), "n"(scale_a), "n"(scale_b)
+            );
+        }
+
+        template <const int scale_d, const int scale_a, const int scale_b>
+        __device__ __forceinline__ void mm24(float r[3][4], uint64_t desc_a, uint64_t desc_b) {
+            asm volatile(
+                "{\n"
+                "wgmma.mma_async.sync.aligned.m64n24k32.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11}, %12, %13, %14, %15, %16;\n"
+                "}\n"
+                : "+f"(r[0][0]), "+f"(r[0][1]), "+f"(r[0][2]), "+f"(r[0][3]),
+                  "+f"(r[1][0]), "+f"(r[1][1]), "+f"(r[1][2]), "+f"(r[1][3]),
+                  "+f"(r[2][0]), "+f"(r[2][1]), "+f"(r[2][2]), "+f"(r[2][3])
+                : "l"(desc_a), "l"(desc_b), "n"(scale_d), "n"(scale_a), "n"(scale_b)
+            );
+        }
+
+        template <const int scale_d, const int scale_a, const int scale_b>
+        __device__ __forceinline__ void mm32(float r[4][4], uint64_t desc_a, uint64_t desc_b) {
+            asm volatile(
+                "{\n"
+                "wgmma.mma_async.sync.aligned.m64n32k32.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, %16, %17, %18, %19, %20;\n"
+                "}\n"
+                : "+f"(r[0][0]), "+f"(r[0][1]), "+f"(r[0][2]), "+f"(r[0][3]),
+                  "+f"(r[1][0]), "+f"(r[1][1]), "+f"(r[1][2]), "+f"(r[1][3]),
+                  "+f"(r[2][0]), "+f"(r[2][1]), "+f"(r[2][2]), "+f"(r[2][3]),
+                  "+f"(r[3][0]), "+f"(r[3][1]), "+f"(r[3][2]), "+f"(r[3][3])
+                : "l"(desc_a), "l"(desc_b), "n"(scale_d), "n"(scale_a), "n"(scale_b)
+            );
+        }
+
+        template <const int scale_d, const int scale_a, const int scale_b>
+        __device__ __forceinline__ void mm40(float r[5][4], uint64_t desc_a, uint64_t desc_b) {
+            asm volatile(
+                "{\n"
+                "wgmma.mma_async.sync.aligned.m64n40k32.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19}, %20, %21, %22, %23, %24;\n"
+                "}\n"
+                : "+f"(r[0][0]), "+f"(r[0][1]), "+f"(r[0][2]), "+f"(r[0][3]),
+                  "+f"(r[1][0]), "+f"(r[1][1]), "+f"(r[1][2]), "+f"(r[1][3]),
+                  "+f"(r[2][0]), "+f"(r[2][1]), "+f"(r[2][2]), "+f"(r[2][3]),
+                  "+f"(r[3][0]), "+f"(r[3][1]), "+f"(r[3][2]), "+f"(r[3][3]),
+                  "+f"(r[4][0]), "+f"(r[4][1]), "+f"(r[4][2]), "+f"(r[4][3])
+                : "l"(desc_a), "l"(desc_b), "n"(scale_d), "n"(scale_a), "n"(scale_b)
+            );
+        }
+
+        template <const int scale_d, const int scale_a, const int scale_b>
+        __device__ __forceinline__ void mm48(float r[6][4], uint64_t desc_a, uint64_t desc_b) {
+            asm volatile(
+                "{\n"
+                "wgmma.mma_async.sync.aligned.m64n48k32.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23}, %24, %25, %26, %27, %28;\n"
+                "}\n"
+                : "+f"(r[0][0]), "+f"(r[0][1]), "+f"(r[0][2]), "+f"(r[0][3]),
+                  "+f"(r[1][0]), "+f"(r[1][1]), "+f"(r[1][2]), "+f"(r[1][3]),
+                  "+f"(r[2][0]), "+f"(r[2][1]), "+f"(r[2][2]), "+f"(r[2][3]),
+                  "+f"(r[3][0]), "+f"(r[3][1]), "+f"(r[3][2]), "+f"(r[3][3]),
+                  "+f"(r[4][0]), "+f"(r[4][1]), "+f"(r[4][2]), "+f"(r[4][3]),
+                  "+f"(r[5][0]), "+f"(r[5][1]), "+f"(r[5][2]), "+f"(r[5][3])
+                : "l"(desc_a), "l"(desc_b), "n"(scale_d), "n"(scale_a), "n"(scale_b)
+            );
+        }
+
+        template <const int scale_d, const int scale_a, const int scale_b>
+        __device__ __forceinline__ void mm56(float r[7][4], uint64_t desc_a, uint64_t desc_b) {
+            asm volatile(
+                "{\n"
+                "wgmma.mma_async.sync.aligned.m64n56k32.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27}, %28, %29, %30, %31, %32;\n"
+                "}\n"
+                : "+f"(r[0][0]), "+f"(r[0][1]), "+f"(r[0][2]), "+f"(r[0][3]),
+                  "+f"(r[1][0]), "+f"(r[1][1]), "+f"(r[1][2]), "+f"(r[1][3]),
+                  "+f"(r[2][0]), "+f"(r[2][1]), "+f"(r[2][2]), "+f"(r[2][3]),
+                  "+f"(r[3][0]), "+f"(r[3][1]), "+f"(r[3][2]), "+f"(r[3][3]),
+                  "+f"(r[4][0]), "+f"(r[4][1]), "+f"(r[4][2]), "+f"(r[4][3]),
+                  "+f"(r[5][0]), "+f"(r[5][1]), "+f"(r[5][2]), "+f"(r[5][3]),
+                  "+f"(r[6][0]), "+f"(r[6][1]), "+f"(r[6][2]), "+f"(r[6][3])
+                : "l"(desc_a), "l"(desc_b), "n"(scale_d), "n"(scale_a), "n"(scale_b)
+            );
+        }
+
+        template <const int scale_d, const int scale_a, const int scale_b>
+        __device__ __forceinline__ void mm64(float r[8][4], uint64_t desc_a, uint64_t desc_b) {
+            asm volatile(
+                "{\n"
+                "wgmma.mma_async.sync.aligned.m64n64k32.f32.bf16.bf16 {"
+                    "%0 ,  %1,  %2,  %3, "
+                    "%4 ,  %5,  %6,  %7, "
+                    "%8 ,  %9, %10, %11, "
+                    "%12, %13, %14, %15, "
+                    "%16, %17, %18, %19, "
+                    "%20, %21, %22, %23, "
+                    "%24, %25, %26, %27, "
+                    "%28, %29, %30, %31, "
+                "}, %32, %33, %34, %35, %36;\n"
+                "}\n"
+                : "+f"(r[0][0]), "+f"(r[0][1]), "+f"(r[0][2]), "+f"(r[0][3]),
+                  "+f"(r[1][0]), "+f"(r[1][1]), "+f"(r[1][2]), "+f"(r[1][3]),
+                  "+f"(r[2][0]), "+f"(r[2][1]), "+f"(r[2][2]), "+f"(r[2][3]),
+                  "+f"(r[3][0]), "+f"(r[3][1]), "+f"(r[3][2]), "+f"(r[3][3]),
+                  "+f"(r[4][0]), "+f"(r[4][1]), "+f"(r[4][2]), "+f"(r[4][3]),
+                  "+f"(r[5][0]), "+f"(r[5][1]), "+f"(r[5][2]), "+f"(r[5][3]),
+                  "+f"(r[6][0]), "+f"(r[6][1]), "+f"(r[6][2]), "+f"(r[6][3]),
+                  "+f"(r[7][0]), "+f"(r[7][1]), "+f"(r[7][2]), "+f"(r[7][3])
+                : "l"(desc_a), "l"(desc_b), "n"(scale_d), "n"(scale_a), "n"(scale_b)
+            );
+        }
+
+        template <const int scale_d, const int scale_a, const int scale_b>
+        __device__ __forceinline__ void mm72(float r[9][4], uint64_t desc_a, uint64_t desc_b) {
+            asm volatile(
+                "{\n"
+                "wgmma.mma_async.sync.aligned.m64n72k32.f32.bf16.bf16 {"
+                    "%0 ,  %1,  %2,  %3, "
+                    "%4 ,  %5,  %6,  %7, "
+                    "%8 ,  %9, %10, %11, "
+                    "%12, %13, %14, %15, "
+                    "%16, %17, %18, %19, "
+                    "%20, %21, %22, %23, "
+                    "%24, %25, %26, %27, "
+                    "%28, %29, %30, %31, "
+                    "%32, %33, %34, %35, "
+                "}, %36, %37, %38, %39, %40;\n"
+                "}\n"
+                : "+f"(r[0][0]), "+f"(r[0][1]), "+f"(r[0][2]), "+f"(r[0][3]),
+                  "+f"(r[1][0]), "+f"(r[1][1]), "+f"(r[1][2]), "+f"(r[1][3]),
+                  "+f"(r[2][0]), "+f"(r[2][1]), "+f"(r[2][2]), "+f"(r[2][3]),
+                  "+f"(r[3][0]), "+f"(r[3][1]), "+f"(r[3][2]), "+f"(r[3][3]),
+                  "+f"(r[4][0]), "+f"(r[4][1]), "+f"(r[4][2]), "+f"(r[4][3]),
+                  "+f"(r[5][0]), "+f"(r[5][1]), "+f"(r[5][2]), "+f"(r[5][3]),
+                  "+f"(r[6][0]), "+f"(r[6][1]), "+f"(r[6][2]), "+f"(r[6][3]),
+                  "+f"(r[7][0]), "+f"(r[7][1]), "+f"(r[7][2]), "+f"(r[7][3]),
+                  "+f"(r[8][0]), "+f"(r[8][1]), "+f"(r[8][2]), "+f"(r[8][3])
+                : "l"(desc_a), "l"(desc_b), "n"(scale_d), "n"(scale_a), "n"(scale_b)
+            );
+        }
+
+        template <const int scale_d, const int scale_a, const int scale_b>
+        __device__ __forceinline__ void mm80(float r[10][4], uint64_t desc_a, uint64_t desc_b) {
+            asm volatile(
+                "{\n"
+                "wgmma.mma_async.sync.aligned.m64n80k32.f32.bf16.bf16 {"
+                    "%0 ,  %1,  %2,  %3, "
+                    "%4 ,  %5,  %6,  %7, "
+                    "%8 ,  %9, %10, %11, "
+                    "%12, %13, %14, %15, "
+                    "%16, %17, %18, %19, "
+                    "%20, %21, %22, %23, "
+                    "%24, %25, %26, %27, "
+                    "%28, %29, %30, %31, "
+                    "%32, %33, %34, %35, "
+                    "%36, %37, %38, %39, "
+                "}, %40, %41, %42, %43, %44;\n"
+                "}\n"
+                : "+f"(r[0][0]), "+f"(r[0][1]), "+f"(r[0][2]), "+f"(r[0][3]),
+                  "+f"(r[1][0]), "+f"(r[1][1]), "+f"(r[1][2]), "+f"(r[1][3]),
+                  "+f"(r[2][0]), "+f"(r[2][1]), "+f"(r[2][2]), "+f"(r[2][3]),
+                  "+f"(r[3][0]), "+f"(r[3][1]), "+f"(r[3][2]), "+f"(r[3][3]),
+                  "+f"(r[4][0]), "+f"(r[4][1]), "+f"(r[4][2]), "+f"(r[4][3]),
+                  "+f"(r[5][0]), "+f"(r[5][1]), "+f"(r[5][2]), "+f"(r[5][3]),
+                  "+f"(r[6][0]), "+f"(r[6][1]), "+f"(r[6][2]), "+f"(r[6][3]),
+                  "+f"(r[7][0]), "+f"(r[7][1]), "+f"(r[7][2]), "+f"(r[7][3]),
+                  "+f"(r[8][0]), "+f"(r[8][1]), "+f"(r[8][2]), "+f"(r[8][3]),
+                  "+f"(r[9][0]), "+f"(r[9][1]), "+f"(r[9][2]), "+f"(r[9][3])
+                : "l"(desc_a), "l"(desc_b), "n"(scale_d), "n"(scale_a), "n"(scale_b)
+            );
+        }
+
+        template <const int scale_d, const int scale_a, const int scale_b>
+        __device__ __forceinline__ void mm88(float r[11][4], uint64_t desc_a, uint64_t desc_b) {
+            asm volatile(
+                "{\n"
+                "wgmma.mma_async.sync.aligned.m64n88k32.f32.bf16.bf16 {"
+                    "%0 ,  %1,  %2,  %3, "
+                    "%4 ,  %5,  %6,  %7, "
+                    "%8 ,  %9, %10, %11, "
+                    "%12, %13, %14, %15, "
+                    "%16, %17, %18, %19, "
+                    "%20, %21, %22, %23, "
+                    "%24, %25, %26, %27, "
+                    "%28, %29, %30, %31, "
+                    "%32, %33, %34, %35, "
+                    "%36, %37, %38, %39, "
+                    "%40, %41, %42, %43, "
+                "}, %44, %45, %46, %47, %48;\n"
+                "}\n"
+                : "+f"(r[0][0]), "+f"(r[0][1]), "+f"(r[0][2]), "+f"(r[0][3]),
+                  "+f"(r[1][0]), "+f"(r[1][1]), "+f"(r[1][2]), "+f"(r[1][3]),
+                  "+f"(r[2][0]), "+f"(r[2][1]), "+f"(r[2][2]), "+f"(r[2][3]),
+                  "+f"(r[3][0]), "+f"(r[3][1]), "+f"(r[3][2]), "+f"(r[3][3]),
+                  "+f"(r[4][0]), "+f"(r[4][1]), "+f"(r[4][2]), "+f"(r[4][3]),
+                  "+f"(r[5][0]), "+f"(r[5][1]), "+f"(r[5][2]), "+f"(r[5][3]),
+                  "+f"(r[6][0]), "+f"(r[6][1]), "+f"(r[6][2]), "+f"(r[6][3]),
+                  "+f"(r[7][0]), "+f"(r[7][1]), "+f"(r[7][2]), "+f"(r[7][3]),
+                  "+f"(r[8][0]), "+f"(r[8][1]), "+f"(r[8][2]), "+f"(r[8][3]),
+                  "+f"(r[9][0]), "+f"(r[9][1]), "+f"(r[9][2]), "+f"(r[9][3]),
+                  "+f"(r[10][0]), "+f"(r[10][1]), "+f"(r[10][2]), "+f"(r[10][3])
+                : "l"(desc_a), "l"(desc_b), "n"(scale_d), "n"(scale_a), "n"(scale_b)
+            );
+        }
+
+        template <const int scale_d, const int scale_a, const int scale_b>
+        __device__ __forceinline__ void mm96(float r[12][4], uint64_t desc_a, uint64_t desc_b) {
+            asm volatile(
+                "{\n"
+                "wgmma.mma_async.sync.aligned.m64n96k32.f32.bf16.bf16 {"
+                    "%0 ,  %1,  %2,  %3,  %4,  %5,  %6,  %7, "
+                    "%8 ,  %9, %10, %11, %12, %13, %14, %15, "
+                    "%16, %17, %18, %19, %20, %21, %22, %23, "
+                    "%24, %25, %26, %27, %28, %29, %30, %31, "
+                    "%32, %33, %34, %35, %36, %37, %38, %39, "
+                    "%40, %41, %42, %43, %44, %45, %46, %47, "
+                    "%48, %49, %50, %51, "
+                "}, %52, %53, %54, %55, %56;\n"
+                "}\n"
+                : "+f"(r[0][0]),  "+f"(r[0][1]),  "+f"(r[0][2]),  "+f"(r[0][3]),
+                  "+f"(r[1][0]),  "+f"(r[1][1]),  "+f"(r[1][2]),  "+f"(r[1][3]),
+                  "+f"(r[2][0]),  "+f"(r[2][1]),  "+f"(r[2][2]),  "+f"(r[2][3]),
+                  "+f"(r[3][0]),  "+f"(r[3][1]),  "+f"(r[3][2]),  "+f"(r[3][3]),
+                  "+f"(r[4][0]),  "+f"(r[4][1]),  "+f"(r[4][2]),  "+f"(r[4][3]),
+                  "+f"(r[5][0]),  "+f"(r[5][1]),  "+f"(r[5][2]),  "+f"(r[5][3]),
+                  "+f"(r[6][0]),  "+f"(r[6][1]),  "+f"(r[6][2]),  "+f"(r[6][3]),
+                  "+f"(r[7][0]),  "+f"(r[7][1]),  "+f"(r[7][2]),  "+f"(r[7][3]),
+                  "+f"(r[8][0]),  "+f"(r[8][1]),  "+f"(r[8][2]),  "+f"(r[8][3]),
+                  "+f"(r[9][0]),  "+f"(r[9][1]),  "+f"(r[9][2]),  "+f"(r[9][3]),
+                  "+f"(r[10][0]), "+f"(r[10][1]), "+f"(r[10][2]), "+f"(r[10][3]),
+                  "+f"(r[11][0]), "+f"(r[11][1]), "+f"(r[11][2]), "+f"(r[11][3])
+                : "l"(desc_a), "l"(desc_b), "n"(scale_d), "n"(scale_a), "n"(scale_b)
+            );
+        }
+
+        template <const int scale_d, const int scale_a, const int scale_b>
+        __device__ __forceinline__ void mm104(float r[13][4], uint64_t desc_a, uint64_t desc_b) {
+            asm volatile(
+                "{\n"
+                "wgmma.mma_async.sync.aligned.m64n104k32.f32.bf16.bf16 {"
+                    "%0 ,  %1,  %2,  %3,  %4,  %5,  %6,  %7, "
+                    "%8 ,  %9, %10, %11, %12, %13, %14, %15, "
+                    "%16, %17, %18, %19, %20, %21, %22, %23, "
+                    "%24, %25, %26, %27, %28, %29, %30, %31, "
+                    "%32, %33, %34, %35, %36, %37, %38, %39, "
+                    "%40, %41, %42, %43, %44, %45, %46, %47, "
+                    "%48, %49, %50, %51, %52, %53, %54, %55, "
+                "}, %56, %57, %58, %59, %60;\n"
+                "}\n"
+                : "+f"(r[0][0]),  "+f"(r[0][1]),  "+f"(r[0][2]),  "+f"(r[0][3]),
+                  "+f"(r[1][0]),  "+f"(r[1][1]),  "+f"(r[1][2]),  "+f"(r[1][3]),
+                  "+f"(r[2][0]),  "+f"(r[2][1]),  "+f"(r[2][2]),  "+f"(r[2][3]),
+                  "+f"(r[3][0]),  "+f"(r[3][1]),  "+f"(r[3][2]),  "+f"(r[3][3]),
+                  "+f"(r[4][0]),  "+f"(r[4][1]),  "+f"(r[4][2]),  "+f"(r[4][3]),
+                  "+f"(r[5][0]),  "+f"(r[5][1]),  "+f"(r[5][2]),  "+f"(r[5][3]),
+                  "+f"(r[6][0]),  "+f"(r[6][1]),  "+f"(r[6][2]),  "+f"(r[6][3]),
+                  "+f"(r[7][0]),  "+f"(r[7][1]),  "+f"(r[7][2]),  "+f"(r[7][3]),
+                  "+f"(r[8][0]),  "+f"(r[8][1]),  "+f"(r[8][2]),  "+f"(r[8][3]),
+                  "+f"(r[9][0]),  "+f"(r[9][1]),  "+f"(r[9][2]),  "+f"(r[9][3]),
+                  "+f"(r[10][0]), "+f"(r[10][1]), "+f"(r[10][2]), "+f"(r[10][3]),
+                  "+f"(r[11][0]), "+f"(r[11][1]), "+f"(r[11][2]), "+f"(r[11][3]),
+                  "+f"(r[12][0]), "+f"(r[12][1]), "+f"(r[12][2]), "+f"(r[12][3])
+                : "l"(desc_a), "l"(desc_b), "n"(scale_d), "n"(scale_a), "n"(scale_b)
+            );
+        }
+
+        template <const int scale_d, const int scale_a, const int scale_b>
+        __device__ __forceinline__ void mm112(float r[14][4], uint64_t desc_a, uint64_t desc_b) {
+            asm volatile(
+                "{\n"
+                "wgmma.mma_async.sync.aligned.m64n112k32.f32.bf16.bf16 {"
+                    "%0 ,  %1,  %2,  %3,  %4,  %5,  %6,  %7, "
+                    "%8 ,  %9, %10, %11, %12, %13, %14, %15, "
+                    "%16, %17, %18, %19, %20, %21, %22, %23, "
+                    "%24, %25, %26, %27, %28, %29, %30, %31, "
+                    "%32, %33, %34, %35, %36, %37, %38, %39, "
+                    "%40, %41, %42, %43, %44, %45, %46, %47, "
+                    "%48, %49, %50, %51, %52, %53, %54, %55, "
+                "}, %56, %57, %58, %59, %60;\n"
+                "}\n"
+                : "+f"(r[0][0]),  "+f"(r[0][1]),  "+f"(r[0][2]),  "+f"(r[0][3]),
+                  "+f"(r[1][0]),  "+f"(r[1][1]),  "+f"(r[1][2]),  "+f"(r[1][3]),
+                  "+f"(r[2][0]),  "+f"(r[2][1]),  "+f"(r[2][2]),  "+f"(r[2][3]),
+                  "+f"(r[3][0]),  "+f"(r[3][1]),  "+f"(r[3][2]),  "+f"(r[3][3]),
+                  "+f"(r[4][0]),  "+f"(r[4][1]),  "+f"(r[4][2]),  "+f"(r[4][3]),
+                  "+f"(r[5][0]),  "+f"(r[5][1]),  "+f"(r[5][2]),  "+f"(r[5][3]),
+                  "+f"(r[6][0]),  "+f"(r[6][1]),  "+f"(r[6][2]),  "+f"(r[6][3]),
+                  "+f"(r[7][0]),  "+f"(r[7][1]),  "+f"(r[7][2]),  "+f"(r[7][3]),
+                  "+f"(r[8][0]),  "+f"(r[8][1]),  "+f"(r[8][2]),  "+f"(r[8][3]),
+                  "+f"(r[9][0]),  "+f"(r[9][1]),  "+f"(r[9][2]),  "+f"(r[9][3]),
+                  "+f"(r[10][0]), "+f"(r[10][1]), "+f"(r[10][2]), "+f"(r[10][3]),
+                  "+f"(r[11][0]), "+f"(r[11][1]), "+f"(r[11][2]), "+f"(r[11][3]),
+                  "+f"(r[13][0]), "+f"(r[13][1]), "+f"(r[13][2]), "+f"(r[13][3])
+                : "l"(desc_a), "l"(desc_b), "n"(scale_d), "n"(scale_a), "n"(scale_b)
+            );
+        }
+
+        template <const int scale_d, const int scale_a, const int scale_b>
+        __device__ __forceinline__ void mm120(float r[15][4], uint64_t desc_a, uint64_t desc_b) {
+            asm volatile(
+                "{\n"
+                "wgmma.mma_async.sync.aligned.m64n120k32.f32.bf16.bf16 {"
+                    "%0 ,  %1,  %2,  %3,  %4,  %5,  %6,  %7, "
+                    "%8 ,  %9, %10, %11, %12, %13, %14, %15, "
+                    "%16, %17, %18, %19, %20, %21, %22, %23, "
+                    "%24, %25, %26, %27, %28, %29, %30, %31, "
+                    "%32, %33, %34, %35, %36, %37, %38, %39, "
+                    "%40, %41, %42, %43, %44, %45, %46, %47, "
+                    "%48, %49, %50, %51, %52, %53, %54, %55, "
+                    "%56, %57, %58, %59, "
+                "}, %60, %61, %62, %63, %64;\n"
+                "}\n"
+                : "+f"(r[0][0]),  "+f"(r[0][1]),  "+f"(r[0][2]),  "+f"(r[0][3]),
+                  "+f"(r[1][0]),  "+f"(r[1][1]),  "+f"(r[1][2]),  "+f"(r[1][3]),
+                  "+f"(r[2][0]),  "+f"(r[2][1]),  "+f"(r[2][2]),  "+f"(r[2][3]),
+                  "+f"(r[3][0]),  "+f"(r[3][1]),  "+f"(r[3][2]),  "+f"(r[3][3]),
+                  "+f"(r[4][0]),  "+f"(r[4][1]),  "+f"(r[4][2]),  "+f"(r[4][3]),
+                  "+f"(r[5][0]),  "+f"(r[5][1]),  "+f"(r[5][2]),  "+f"(r[5][3]),
+                  "+f"(r[6][0]),  "+f"(r[6][1]),  "+f"(r[6][2]),  "+f"(r[6][3]),
+                  "+f"(r[7][0]),  "+f"(r[7][1]),  "+f"(r[7][2]),  "+f"(r[7][3]),
+                  "+f"(r[8][0]),  "+f"(r[8][1]),  "+f"(r[8][2]),  "+f"(r[8][3]),
+                  "+f"(r[9][0]),  "+f"(r[9][1]),  "+f"(r[9][2]),  "+f"(r[9][3]),
+                  "+f"(r[10][0]), "+f"(r[10][1]), "+f"(r[10][2]), "+f"(r[10][3]),
+                  "+f"(r[11][0]), "+f"(r[11][1]), "+f"(r[11][2]), "+f"(r[11][3]),
+                  "+f"(r[12][0]), "+f"(r[12][1]), "+f"(r[12][2]), "+f"(r[12][3]),
+                  "+f"(r[13][0]), "+f"(r[13][1]), "+f"(r[13][2]), "+f"(r[13][3]),
+                  "+f"(r[14][0]), "+f"(r[14][1]), "+f"(r[14][2]), "+f"(r[14][3])
+                : "l"(desc_a), "l"(desc_b), "n"(scale_d), "n"(scale_a), "n"(scale_b)
+            );
+        }
+
+        __device__ __forceinline__ void mm128(float r[16][4], uint64_t desc_a, uint64_t desc_b) {
+            asm volatile(
+                "{\n"
+                "wgmma.mma_async.sync.aligned.m64n128k32.f32.bf16.bf16 {"
+                    "%0 ,  %1,  %2,  %3,  %4,  %5,  %6,  %7, "
+                    "%8 ,  %9, %10, %11, %12, %13, %14, %15, "
+                    "%16, %17, %18, %19, %20, %21, %22, %23, "
+                    "%24, %25, %26, %27, %28, %29, %30, %31, "
+                    "%32, %33, %34, %35, %36, %37, %38, %39, "
+                    "%40, %41, %42, %43, %40, %41, %42, %43, "
+                    "%44, %45, %46, %47, %48, %49, %50, %51, "
+                    "%52, %53, %54, %55, %56, %57, %58, %59, "
+                    "%60, %61, %62, %63, "
+                "}, %64, %65, %66, %67, %68;\n"
+                "}\n"
+                : "+f"(r[0][0]),  "+f"(r[0][1]),  "+f"(r[0][2]),  "+f"(r[0][3]),
+                  "+f"(r[1][0]),  "+f"(r[1][1]),  "+f"(r[1][2]),  "+f"(r[1][3]),
+                  "+f"(r[2][0]),  "+f"(r[2][1]),  "+f"(r[2][2]),  "+f"(r[2][3]),
+                  "+f"(r[3][0]),  "+f"(r[3][1]),  "+f"(r[3][2]),  "+f"(r[3][3]),
+                  "+f"(r[4][0]),  "+f"(r[4][1]),  "+f"(r[4][2]),  "+f"(r[4][3]),
+                  "+f"(r[5][0]),  "+f"(r[5][1]),  "+f"(r[5][2]),  "+f"(r[5][3]),
+                  "+f"(r[6][0]),  "+f"(r[6][1]),  "+f"(r[6][2]),  "+f"(r[6][3]),
+                  "+f"(r[7][0]),  "+f"(r[7][1]),  "+f"(r[7][2]),  "+f"(r[7][3]),
+                  "+f"(r[8][0]),  "+f"(r[8][1]),  "+f"(r[8][2]),  "+f"(r[8][3]),
+                  "+f"(r[9][0]),  "+f"(r[9][1]),  "+f"(r[9][2]),  "+f"(r[9][3]),
+                  "+f"(r[10][0]), "+f"(r[10][1]), "+f"(r[10][2]), "+f"(r[10][3]),
+                  "+f"(r[11][0]), "+f"(r[11][1]), "+f"(r[11][2]), "+f"(r[11][3]),
+                  "+f"(r[12][0]), "+f"(r[12][1]), "+f"(r[12][2]), "+f"(r[12][3]),
+                  "+f"(r[13][0]), "+f"(r[13][1]), "+f"(r[13][2]), "+f"(r[13][3]),
+                  "+f"(r[14][0]), "+f"(r[14][1]), "+f"(r[14][2]), "+f"(r[14][3]),
+                  "+f"(r[15][0]), "+f"(r[15][1]), "+f"(r[15][2]), "+f"(r[15][3])
+                : "l"(desc_a), "l"(desc_b), "n"(scale_d), "n"(scale_a), "n"(scale_b)
+            );
+        }
+
+        template <const int bm>
+        __device__ __forceinline__ void wgmma(float r[bm>>3][4], uint64_t desc_a, uint64_t desc_b) {
+            static_assert(bm >= 8 && bm <= 128 && !(bm & 7));
+            if constexpr (bm == 8)   mm8  (r, desc_a, desc_b);
+            if constexpr (bm == 16)  mm16 (r, desc_a, desc_b);
+            if constexpr (bm == 24)  mm24 (r, desc_a, desc_b);
+            if constexpr (bm == 32)  mm32 (r, desc_a, desc_b);
+            if constexpr (bm == 40)  mm40 (r, desc_a, desc_b);
+            if constexpr (bm == 48)  mm48 (r, desc_a, desc_b);
+            if constexpr (bm == 56)  mm56 (r, desc_a, desc_b);
+            if constexpr (bm == 64)  mm64 (r, desc_a, desc_b);
+            if constexpr (bm == 72)  mm72 (r, desc_a, desc_b);
+            if constexpr (bm == 80)  mm80 (r, desc_a, desc_b);
+            if constexpr (bm == 88)  mm88 (r, desc_a, desc_b);
+            if constexpr (bm == 96)  mm96 (r, desc_a, desc_b);
+            if constexpr (bm == 104) mm104(r, desc_a, desc_b);
+            if constexpr (bm == 112) mm112(r, desc_a, desc_b);
+            if constexpr (bm == 120) mm120(r, desc_a, desc_b);
+            if constexpr (bm == 128) mm128(r, desc_a, desc_b);
+        }
     }
 
     namespace reg_alloc {
@@ -47,11 +439,11 @@ namespace pi {
         }
 
         __device__ __forceinline__ void commit_batch() {
-            asm volatile ("wgmma.commit_group.sync.aligned;\n" ::: "memory");
+            asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
         }
 
         __device__ __forceinline__ void await() {
-            asm volatile ("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
+            asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
         }
     }
 

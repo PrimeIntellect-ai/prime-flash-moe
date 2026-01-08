@@ -8,6 +8,8 @@ from torch.utils.cpp_extension import BuildExtension, CppExtension, CUDAExtensio
 ROOT = Path(__file__).parent.resolve()
 CSRC_DIR = os.path.join('fused_experts', 'C', 'csrc')
 
+os.environ["TORCH_CUDA_ARCH_LIST"] = "9.0a"
+
 if os.environ.get('DEBUG'):
     extra_compile_args = ['-DDEBUG', '-O0']
 else:

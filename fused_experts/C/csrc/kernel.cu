@@ -56,6 +56,8 @@ static __global__ void fused_experts_megakernel(
     int N,
     int M
 ) {
+    float r[1][4];
+    pi::wgmma::wgmma<2, 2, 2, 8>(r, 1, 2);
     int e = blockIdx.x;
     if (e >= E) return;
     int startE = !e ? 0 : offsets[e-1];
