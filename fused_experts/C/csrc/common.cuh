@@ -445,13 +445,13 @@ namespace pi {
             );
         }
 
-        template <const int nb>
-        __device__ __forceinline__ void cg256(void *dst, const void *src) {
+        template <const int nb, typename t_dst, typename t_src>
+        __device__ __forceinline__ void cg256(t_dst dst, t_src src) {
             asm volatile("cp.async.cg.shared.global.L2::256B [%0], [%1], %2;\n" :: "r"(dst), "l"(src), "n"(nb));
         }
 
-        template <const int nb>
-        __device__ __forceinline__ void cg64(void *dst, const void *src) {
+        template <const int nb, typename t_dst, typename t_src>
+        __device__ __forceinline__ void cg64(t_dst dst, t_src src) {
             asm volatile("cp.async.cg.shared.global.L2::64B [%0], [%1], %2;\n" :: "r"(dst), "l"(src), "n"(nb));
         }
 

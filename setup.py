@@ -40,7 +40,7 @@ if platform.system() == 'Darwin':
 extensions = [
     CUDAExtension(
         name='fused_experts.C.csrc.kernel',
-        sources=[os.path.join(CSRC_DIR, 'kernel.cu')],
+        sources=[os.path.join(CSRC_DIR, 'fused_moe_kernel.cu')],
         extra_compile_args=extra_compile_args,
         extra_link_args=extra_link_args,
         include_dirs=cutlass_includes,
