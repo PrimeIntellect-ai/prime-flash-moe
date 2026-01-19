@@ -1,9 +1,25 @@
 #include "common.cuh"
 
+#include <stdexcept>
+
 #include <mma.h>
 #include <cuda/ptx>
+#include <cuda.h>
+#include <cudaTypedefs.h>
 
 namespace pi {
+    [[nogiscard]] static PFN_cuTensorMapEncodeTiled_v12000 getProcAddress_cuTensorMapEncodeTiled() {
+        static PFN_cuTensorMapEncodeTiled_v12000 fn = nullptr;
+        if (fn) return fn;
+        cudaDriverEntryPointQueryResult stat;
+        void *pfn = nullptr;
+        auto res = cudaGetDriverEntryPointByVersion("cuTensorMapEncodeTiled", &pfn, 12000, cudaEnableDefault, &stat); 
+        if (res != cudaSuccess || stat != cudaDriverEntryPointSuccess)
+            throw std::runtime_error {"Failed to get address of cuTensorMapEncodeTiled: " + std::string{cudaGetErrorString(res)}};
+        fn = reinterpret_cast<PFN_cuTensorMapEncodeTiled_v12000>(pfn);
+        return fn;
+    }
+
     [[nodiscard]] static __device__ __forceinline__ float swiglu(float x, float w) {
         return w*(x/(1.f+__expf(-x)));
     }
@@ -22,7 +38,7 @@ namespace pi {
     };
 
     template <const int32_t BM, const int32_t BK, const int32_t BN, const int32_t WN, const int32_t STAGES, const int32_t PRODUCER_THREADS>
-    static __global__ __launch_bounds__(WN*32 + PRODUCER_THREADS) void fused_moe_bf16(
+    static __global__ __launch_bounds__(WN*32 + PRODUCER_THREADS) void fused_moe_kernel(
         const __nv_bfloat16 *__restrict__ x,
         const __grid_constant__ CUtensorMap map_w,
         const __grid_constant__ CUtensorMap map_w2,
@@ -264,4 +280,93 @@ namespace pi {
         else consumer();
     }
 
+    template <const int32_t BM, const int32_t BN, const int32_t WN, const int32_t STAGES>
+    static void launch_fused_moe_kernel(
+        const __nv_bfloat16 *x,
+        __nv_bfloat16 *w,
+        __nv_bfloat16 *w2,
+        __nv_bfloat16 *out,
+        const int32_t *sorted_token_ids,
+        const int32_t *expert_idxs,
+        const int32_t *num_tokens_post_padded,
+        const float *topk_weights,
+        int32_t top_k,
+        int32_t M,
+        int32_t K,
+        int32_t N,
+        int32_t num_experts,
+        int32_t sorted_num,
+        int32_t block_m,
+        cudaStream_t stream
+    ) {
+        static constexpr auto BK = 128;
+        static constexpr auto PRODUCER_THREADS = 128;
+        static constexpr size_t smem = std::max(sizeof(smem_up_pod<STAGES, WN, BM, BK, BN>), sizeof(smem_down_pod<STAGES, WN, BM, BK, BN>));
+        dim3 block = {(WN<<5) + PRODUCER_THREADS, 1, 1};
+        dim3 grid = {
+            std::ceil(static_cast<double>(N)/static_cast<double>(BN*WN)),
+            std::ceil(static_cast<double>(sorted_num)/static_cast<double>(block_m)),
+            1
+        };
+        if (cudaFuncSetAttribute(fused_moe_kernel<BM, BK, BN, WN, STAGES>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem) != cudaSuccess)
+            throw std::runtime_error {"Failed to set max dynamic shared memory size for fused_moe_kernel: " + std::to_string(smem) + " bytes"};
+        auto cuTensorMapEncodeTiled = getProcAddress_cuTensorMapEncodeTiled();
+        CUtensorMap map_w = {};
+        {
+            constexpr auto rank = 2;
+            uint64_t shape[rank] = {static_cast<uint64_t>(K), static_cast<uint64_t>(N*num_experts)};
+            uint64_t strides[rank] = {K*sizeof(__nv_bfloat16)};
+            uint32_t box[rank] = {BK, BN*WN};
+            uint32_t elem_strides[rank] = {1, 1};
+            auto res = cuTensorMapEncodeTiled(
+                &map_w,
+                CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT16,
+                rank,
+                w,
+                shape,
+                strides,
+                box,
+                elem_strides,
+                CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
+                CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
+                CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+                CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
+            );
+        }
+        CUtensorMap map_w2 = {};
+        {
+            constexpr auto BK2 = (WN*BN)>>1;
+            constexpr auto BN2 = BK<<1;
+            auto K2 = N>>1;
+            auto N2 = K;
+            constexpr auto rank = 2;
+            uint64_t shape[rank] = {static_cast<uint64_t>(K2), static_cast<uint64_t>(N2*num_experts)};
+            uint64_t strides[rank] = {K2*sizeof(__nv_bfloat16)};
+            uint32_t box[rank] = {BK2, BN2};
+            uint32_t elem_strides[rank] = {1, 1};
+            auto res = cuTensorMapEncodeTiled(
+                &map_w2,
+                CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT16,
+                rank,
+                w2,
+                shape,
+                strides,
+                box,
+                elem_strides,
+                CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
+                WN*BN == 256 ? CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B : WN*BN == 128 ? CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_64B : CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_32B,
+                CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+                CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
+            );
+        }
+        fused_moe_kernel<BM, BK, BN, WN, STAGES, PRODUCER_THREADS><<<grid, block, smem, stream>>>(
+            x,
+            map_w,
+            map_w2,
+            out,
+            sorted_token_ids,
+            expert_idxs,
+            num_tokens_post_padded
+        );
+    }
 }
