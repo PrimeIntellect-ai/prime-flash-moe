@@ -40,7 +40,7 @@ if platform.system() == 'Darwin':
 extensions = [
     CUDAExtension(
         name='fused_experts.C.csrc.kernel',
-        sources=[os.path.join(CSRC_DIR, 'fused_moe_kernel.cu')],
+        sources=[os.path.join(CSRC_DIR, 'torch_interface.cpp'), os.path.join(CSRC_DIR, 'kernels/fused_moe_kernel.cu')],
         extra_compile_args=extra_compile_args,
         extra_link_args=extra_link_args,
         include_dirs=cutlass_includes,
@@ -50,7 +50,7 @@ extensions = [
 setup(
     name='fused_experts',
     ext_modules=extensions,
-    packages=['fused_experts', 'fused_experts.C.csrc'],
+    packages=['fused_experts', 'fused_experts.C.csrc', 'fused_experts.C.csrc.kernels'],
     package_data={
         'fused_experts.C.csrc': ['*.pyi'],  # Include .pyi files
     },

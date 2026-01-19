@@ -8,7 +8,7 @@
 #include <cudaTypedefs.h>
 
 namespace pi {
-    [[nogiscard]] static PFN_cuTensorMapEncodeTiled_v12000 getProcAddress_cuTensorMapEncodeTiled() {
+    [[nodiscard]] static PFN_cuTensorMapEncodeTiled_v12000 getProcAddress_cuTensorMapEncodeTiled() {
         static PFN_cuTensorMapEncodeTiled_v12000 fn = nullptr;
         if (fn) return fn;
         cudaDriverEntryPointQueryResult stat;
@@ -65,9 +65,7 @@ namespace pi {
         static constexpr int32_t XS = BK*BM;                // SMEM
         static constexpr int32_t TB = 16;                   // CP_ASYNC granularity
         static constexpr int32_t TO = TB/sizeof(__nv_bfloat16);    // Transfer thread offset
-        static constexpr int32_t TPT = BM>>2;               // Tokens per thread
         static constexpr int32_t TN2 = BN2/(WARP_GROUPS<<6);
-        static constexpr int32_t SPSD = BN2 / *BLOCK_SHAPE;
         static constexpr int32_t TM = BM>>3;
         static constexpr int32_t TN = BN>>4;
         static constexpr int32_t PAD = BN2+8;
@@ -82,7 +80,6 @@ namespace pi {
         int32_t warp_m = blockIdx.y;
         int32_t expert_idx = expert_idxs[warp_m];
         if (BM*warp_m >= *num_tokens_post_padded) return;
-        int32_t K2 = N>>1;
         int32_t N2 = K;
         int32_t lane_id = threadIdx.x&31;
         bool is_prod = threadIdx.x < PRODUCER_THREADS;
@@ -142,7 +139,7 @@ namespace pi {
                 ++smem_stage;
             }
             auto &smem_down = *reinterpret_cast<smem_down_pod<STAGES, WN, BM, BK, BN> *>(smem_raw);
-            for (int32_t stage=0; stage < n_stages_up; ++stage) {
+            for (int32_t stage=0; stage < n_stages_down; ++stage) {
                 if (smem_stage == STAGES) {
                     phase ^= 1;
                     smem_stage = 0;
@@ -173,7 +170,7 @@ namespace pi {
                 for (int i=0; i < TN; ++i)
                     for (int j=0; j < TM; ++j)
                         for (int k=0; k < 4; ++k)
-                            asm volatile ("f" : "+f"(tile[i][j][k]) :: "memory");
+                            asm volatile ("" : "+f"(tile[i][j][k]) :: "memory");
                 cuda::ptx::fence_proxy_async(cuda::ptx::space_shared);
                 warp_group::arrive();
                 for (int32_t i=0; i < TN; ++i) {
@@ -181,18 +178,20 @@ namespace pi {
                     __nv_bfloat16 *sx = smem_up.x + smem_stage*XS;
                     uint64_t desc_w = smem_desc_encode<64, 1, SWIZZLE_MODE_UP>(sw);
                     uint64_t desc_x = smem_desc_encode<64, 1, SWIZZLE_MODE_UP>(sx);
-                    wgmma::wgmma<1, 1, 1, BM>(tile[i], desc_w, desc_x);
-                    wgmma::wgmma<1, 1, 1, BM>(tile[i], desc_w+1*(32>>4), desc_x+1*(32>>4));
-                    wgmma::wgmma<1, 1, 1, BM>(tile[i], desc_w+2*(32>>4), desc_x+2*(32>>4));
-                    wgmma::wgmma<1, 1, 1, BM>(tile[i], desc_w+3*(32>>4), desc_x+3*(32>>4));
+                    wgmma::wgmma<BM>(tile[i], desc_w, desc_x);
+                    wgmma::wgmma<BM>(tile[i], desc_w+1*(32>>4), desc_x+1*(32>>4));
+                    wgmma::wgmma<BM>(tile[i], desc_w+2*(32>>4), desc_x+2*(32>>4));
+                    wgmma::wgmma<BM>(tile[i], desc_w+3*(32>>4), desc_x+3*(32>>4));
                 }
                 warp_group::commit_batch();
                 warp_group::await();
                 barrier::arrive(bar+STAGES+smem_stage);
                 for (int32_t tm=0; tm < TM; ++tm)
                 for (int32_t tn=0; tn < TN; ++tn) {
-                    facc[tn][tm][0] += float2(tile[tn][tm][0], tile[tn][tm][1]);
-                    facc[tn][tm][1] += float2(tile[tn][tm][2], tile[tn][tm][3]);
+                    facc[tn][tm][0].x += tile[tn][tm][0];
+                    facc[tn][tm][0].y += tile[tn][tm][1];
+                    facc[tn][tm][1].x += tile[tn][tm][2];
+                    facc[tn][tm][1].y += tile[tn][tm][3];
                 }
                 ++smem_stage;
             }
@@ -220,7 +219,6 @@ namespace pi {
                     phase ^= 1;
                     smem_stage = 0;
                 }
-                float s_2[TN2>>1] = {};
                 float tile[TN2][TM][4] = {};
                 __nv_bfloat16 *sx = smem_down.x;
                 barrier::await(bar+smem_stage, phase);
@@ -228,15 +226,15 @@ namespace pi {
                 for (int i=0; i < TN2; ++i)
                     for (int j=0; j < TM; ++j)
                         for (int k=0; k < 4; ++k)
-                            asm volatile ("f" : "+f"(tile[i][j][k]) :: "memory");
+                            asm volatile ("" : "+f"(tile[i][j][k]) :: "memory");
                 warp_group::arrive();
                 for (int32_t tn2=0; tn2 < TN2; ++tn2) {
                     __nv_bfloat16 *sw = smem_down.w + smem_stage*WS + (((warp_id>>2)*TN2 + tn2)<<6)*BK2;
-                    uint64_t desc_w = smem_desc_encode<BK2/2, 1, 1, SWIZZLE_MODE_DOWN>(sw);
-                    uint64_t desc_x = smem_desc_encode<BK2/2, 1, 1, SWIZZLE_MODE_DOWN>(sx);
+                    uint64_t desc_w = smem_desc_encode<BK2/2, 1, SWIZZLE_MODE_DOWN>(sw);
+                    uint64_t desc_x = smem_desc_encode<BK2/2, 1, SWIZZLE_MODE_DOWN>(sx);
                     #pragma unroll
                     for (int32_t tk=0; tk < BK2>>5; ++tk) {
-                        wgmma::wgmma<1, 1, 1, BM>(tile[tn2], desc_w, desc_x);
+                        wgmma::wgmma<BM>(tile[tn2], desc_w, desc_x);
                         desc_w += 32>>4;
                         desc_x += 32>>4;
                     }
@@ -245,14 +243,14 @@ namespace pi {
                 warp_group::await();
                 barrier::arrive(bar+STAGES+smem_stage);
                 __nv_bfloat16 out_tile[TN2>>1][TM][8];
-                for (int32_t tn2=0; tn2 < TN2; ++tn2)
+                for (int32_t tn2=0; tn2 < TN2; tn2 += 2)
                 for (int32_t tm=0; tm < TM; ++tm)
                 for (int32_t t=0; t < 8; ++t)
-                    out_tile[tn2>>1][tm][t] = tile[tn2 + (t>>2)][tm][t&3];
+                    out_tile[tn2>>1][tm][t] = __float2bfloat16(tile[tn2 + (t>>2)][tm][t&3]);
                 asm volatile ("cp.async.bulk.wait_group 0;\n");
                 cuda::ptx::fence_proxy_async(cuda::ptx::space_shared);
                 con_sync();
-                for (int32_t tn2=0; tn2 < TN2; ++tn2)
+                for (int32_t tn2=0; tn2 < TN2; tn2 += 2)
                 for (int32_t tm=0; tm < TM; ++tm) {
                     int32_t o_row = (tm<<3) + (lane_id&7);
                     int32_t o_col = (warp_id>>2)*(TN2<<6) + ((warp_id&3)<<4) + (lane_id&8) + (tn2<<6) + ((lane_id>>4)<<6);
@@ -301,15 +299,15 @@ namespace pi {
     ) {
         static constexpr auto BK = 128;
         static constexpr auto PRODUCER_THREADS = 128;
-        static constexpr size_t smem = std::max(sizeof(smem_up_pod<STAGES, WN, BM, BK, BN>), sizeof(smem_down_pod<STAGES, WN, BM, BK, BN>));
+        static constexpr size_t SMEM = std::max(sizeof(smem_up_pod<STAGES, WN, BM, BK, BN>), sizeof(smem_down_pod<STAGES, WN, BM, BK, BN>));
         dim3 block = {(WN<<5) + PRODUCER_THREADS, 1, 1};
         dim3 grid = {
-            std::ceil(static_cast<double>(N)/static_cast<double>(BN*WN)),
-            std::ceil(static_cast<double>(sorted_num)/static_cast<double>(block_m)),
+            static_cast<uint32_t>(std::ceil(static_cast<double>(N)/static_cast<double>(BN*WN))),
+            static_cast<uint32_t>(std::ceil(static_cast<double>(sorted_num)/static_cast<double>(block_m))),
             1
         };
-        if (cudaFuncSetAttribute(fused_moe_kernel<BM, BK, BN, WN, STAGES>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem) != cudaSuccess)
-            throw std::runtime_error {"Failed to set max dynamic shared memory size for fused_moe_kernel: " + std::to_string(smem) + " bytes"};
+        if (cudaFuncSetAttribute(&fused_moe_kernel<BM, BK, BN, WN, STAGES, PRODUCER_THREADS>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM) != cudaSuccess)
+            throw std::runtime_error {"Failed to set max dynamic shared memory size for fused_moe_kernel: " + std::to_string(SMEM) + " bytes"};
         auto cuTensorMapEncodeTiled = getProcAddress_cuTensorMapEncodeTiled();
         CUtensorMap map_w = {};
         {
@@ -359,14 +357,104 @@ namespace pi {
                 CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
             );
         }
-        fused_moe_kernel<BM, BK, BN, WN, STAGES, PRODUCER_THREADS><<<grid, block, smem, stream>>>(
+        fused_moe_kernel<BM, BK, BN, WN, STAGES, PRODUCER_THREADS><<<grid, block, SMEM, stream>>>(
             x,
             map_w,
             map_w2,
             out,
             sorted_token_ids,
             expert_idxs,
-            num_tokens_post_padded
+            num_tokens_post_padded,
+            topk_weights,
+            top_k,
+            M,
+            K,
+            N
         );
+    }
+
+    template <const int32_t BM, const int32_t BN, const int32_t WN>
+    static void dispatch_stages(
+        int32_t stages,
+        const __nv_bfloat16 *x,
+        __nv_bfloat16 *w,
+        __nv_bfloat16 *w2,
+        __nv_bfloat16 *out,
+        const int32_t *sorted_token_ids,
+        const int32_t *expert_idxs,
+        const int32_t *num_tokens_post_padded,
+        const float *topk_weights,
+        int32_t top_k,
+        int32_t M,
+        int32_t K,
+        int32_t N,
+        int32_t num_experts,
+        int32_t sorted_num,
+        int32_t block_m,
+        cudaStream_t stream
+    ) {
+        switch (stages) {
+            case 1: launch_fused_moe_kernel<BM, BN, WN, 1>(x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream); break;
+            case 2: launch_fused_moe_kernel<BM, BN, WN, 2>(x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream); break;
+            case 3: launch_fused_moe_kernel<BM, BN, WN, 3>(x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream); break;
+            case 4: launch_fused_moe_kernel<BM, BN, WN, 4>(x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream); break;
+            case 5: launch_fused_moe_kernel<BM, BN, WN, 5>(x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream); break;
+            default: throw std::runtime_error {"Invalid number of stages: " + std::to_string(stages)};
+        }
+    }
+
+    template <const int32_t BM>
+    static void dispatch_bn_wn(
+        int32_t bn,
+        int32_t wn,
+        int32_t stages,
+        const __nv_bfloat16 *x,
+        __nv_bfloat16 *w,
+        __nv_bfloat16 *w2,
+        __nv_bfloat16 *out,
+        const int32_t *sorted_token_ids,
+        const int32_t *expert_idxs,
+        const int32_t *num_tokens_post_padded,
+        const float *topk_weights,
+        int32_t top_k,
+        int32_t M,
+        int32_t K,
+        int32_t N,
+        int32_t num_experts,
+        int32_t sorted_num,
+        int32_t block_m,
+        cudaStream_t stream
+    ) {
+        switch (((bn&0xff)<<8)+(wn&0xff)) {
+            case (32<<8)+8: dispatch_stages<BM, 32, 8>(stages, x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream); break;
+            case (64<<8)+4: dispatch_stages<BM, 64, 4>(stages, x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream); break;
+            default: throw std::runtime_error {"Invalid BN and WN: " + std::to_string(bn) + " and " + std::to_string(wn)};
+        }
+    }
+
+    void fused_moe_bf16(
+        const __nv_bfloat16 *x,
+        __nv_bfloat16 *w,
+        __nv_bfloat16 *w2,
+        __nv_bfloat16 *out,
+        const int32_t *sorted_token_ids,
+        const int32_t *expert_idxs,
+        const int32_t *num_tokens_post_padded,
+        const float *topk_weights,
+        int32_t top_k,
+        int32_t M,
+        int32_t K,
+        int32_t N,
+        int32_t num_experts,
+        int32_t sorted_num,
+        int32_t block_m,
+        int32_t block_n,
+        int32_t warp_n,
+        int32_t stages,
+        cudaStream_t stream
+    ) {
+       switch (block_m) {
+            case 8: dispatch_bn_wn<8>(block_n, warp_n, stages, x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream); break;
+       }
     }
 }

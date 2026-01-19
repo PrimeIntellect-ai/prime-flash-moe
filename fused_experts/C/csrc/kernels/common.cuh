@@ -438,7 +438,7 @@ namespace pi {
             auto pmbar = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
             auto pdst = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
             asm volatile(
-                "cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes [%0] [%1, {%3, %4}], [%2];\n"
+                "cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes [%0], [%1, {%3, %4}], [%2];\n"
                 :
                 : "r"(pdst), "l"(ptma), "r"(pmbar), "r"(row), "r"(col)
                 : "memory"
@@ -452,7 +452,7 @@ namespace pi {
 
         template <const int nb, typename t_dst, typename t_src>
         __device__ __forceinline__ void cg64(t_dst dst, t_src src) {
-            asm volatile("cp.async.cg.shared.global.L2::64B [%0], [%1], %2;\n" :: "r"(dst), "l"(src), "n"(nb));
+            asm volatile("cp.async.ca.shared.global.L2::64B [%0], [%1], %2;\n" :: "r"(dst), "l"(src), "n"(nb));
         }
 
         __device__ __forceinline__ void commit_group() {
@@ -490,7 +490,7 @@ namespace pi {
 
         __device__ __forceinline__ void expect_nb(uint64_t *bar, uint32_t nb) {
             asm volatile(
-                "mbarrier.arrive.expect_tx.release.cta.shared::ctx.b64 _, [%0], %1;\n"
+                "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;\n"
                 :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(bar))), "r"(nb)
             );
         }
@@ -546,11 +546,11 @@ namespace pi {
         template <const bool T>
         __device__ __forceinline__ void store2(uint32_t *tile, uint32_t mat) {
             if constexpr (T) asm volatile(
-                "stmatrix.sync.aligned.m8n8.x2.shared.b16 [%0], {%1 %2};\n"
+                "stmatrix.sync.aligned.m8n8.x2.shared.b16 [%0], {%1, %2};\n"
                 :: "r"(mat), "r"(tile[0]), "r"(tile[1])
                 : "memory"
             ); else asm volatile(
-                "stmatrix.sync.aligned.m8n8.x2.trans.shared.b16 [%0], {%1 %2};\n"
+                "stmatrix.sync.aligned.m8n8.x2.trans.shared.b16 [%0], {%1, %2};\n"
                 :: "r"(mat), "r"(tile[0]), "r"(tile[1])
                 : "memory"
             );
@@ -559,11 +559,11 @@ namespace pi {
         template <const bool T>
         __device__ __forceinline__ void store4(uint32_t *tile, uint32_t mat) {
             if constexpr (T) asm volatile(
-                "stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1 %2 %3 %4};\n"
+                "stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
                 :: "r"(mat), "r"(tile[0]), "r"(tile[1]), "r"(tile[2]), "r"(tile[3])
                 : "memory"
             ); else asm volatile(
-                "stmatrix.sync.aligned.m8n8.x4.trans.shared.b16 [%0], {%1 %2 %3 %4};\n"
+                "stmatrix.sync.aligned.m8n8.x4.trans.shared.b16 [%0], {%1, %2, %3, %4};\n"
                 :: "r"(mat), "r"(tile[0]), "r"(tile[1]), "r"(tile[2]), "r"(tile[3])
                 : "memory"
             );
