@@ -4,31 +4,29 @@
 #include <cuda/ptx>
 
 namespace pi {
-    using bf16_t = __nv_bfloat16;
-
     [[nodiscard]] static __device__ __forceinline__ float swiglu(float x, float w) {
         return w*(x/(1.f+__expf(-x)));
     }
 
     template <const int32_t STAGES, const int32_t WN, const int32_t BM, const int32_t BK, const int32_t BN>
     struct smem_up_pod {
-        alignas(1024) bf16_t w[STAGES*WN*BK*BN];
-        alignas(1024) bf16_t x[STAGES*BK*BM];
+        alignas(1024) __nv_bfloat16 w[STAGES*WN*BK*BN];
+        alignas(1024) __nv_bfloat16 x[STAGES*BK*BM];
     };
 
     template <const int32_t STAGES, const int32_t WN, const int32_t BM, const int32_t BK, const int32_t BN>
     struct smem_down_pod {
-        alignas(1024) bf16_t w[STAGES*WN*BK*BN];
-        alignas(1024) bf16_t x[BM*WN*BN/2];
-        alignas(16) bf16_t out[BM*(BK*2 + 8)];
+        alignas(1024) __nv_bfloat16 w[STAGES*WN*BK*BN];
+        alignas(1024) __nv_bfloat16 x[BM*WN*BN/2];
+        alignas(16) __nv_bfloat16 out[BM*(BK*2 + 8)];
     };
 
     template <const int32_t BM, const int32_t BK, const int32_t BN, const int32_t WN, const int32_t STAGES, const int32_t PRODUCER_THREADS>
     static __global__ __launch_bounds__(WN*32 + PRODUCER_THREADS) void fused_moe_bf16(
-        const bf16_t *__restrict__ x,
+        const __nv_bfloat16 *__restrict__ x,
         const __grid_constant__ CUtensorMap map_w,
         const __grid_constant__ CUtensorMap map_w2,
-        bf16_t *__restrict__ out,
+        __nv_bfloat16 *__restrict__ out,
         const int32_t *__restrict__ sorted_token_ids,
         const int32_t *__restrict__ expert_idxs,
         const int32_t *__restrict__ num_tokens_post_padded,
@@ -50,13 +48,14 @@ namespace pi {
         static constexpr int32_t WS = WN*BK*BN;             // SMEM
         static constexpr int32_t XS = BK*BM;                // SMEM
         static constexpr int32_t TB = 16;                   // CP_ASYNC granularity
-        static constexpr int32_t TO = TB/sizeof(bf16_t);    // Transfer thread offset
+        static constexpr int32_t TO = TB/sizeof(__nv_bfloat16);    // Transfer thread offset
         static constexpr int32_t TPT = BM>>2;               // Tokens per thread
         static constexpr int32_t TN2 = BN2/(WARP_GROUPS<<6);
         static constexpr int32_t SPSD = BN2 / *BLOCK_SHAPE;
         static constexpr int32_t TM = BM>>3;
         static constexpr int32_t TN = BN>>4;
-        static constexpr int X_IT = const_ceil(XS/static_cast<float>(PRODUCER_THREADS*TO));
+        static constexpr int32_t PAD = BN2+8;
+        static constexpr int32_t X_IT = const_ceil(XS/static_cast<float>(PRODUCER_THREADS*TO));
 
         extern __shared__ __align__(1024) uint8_t smem_raw[];
         __shared__ __align__(8) uint64_t bar[STAGES<<1];
@@ -121,7 +120,7 @@ namespace pi {
                 }
                 barrier::arrive_cp_async_mem(bar+smem_stage);
                 if (!threadIdx.x) {
-                    barrier::expect_nb(bar+smem_stage, WS*sizeof(bf16_t));
+                    barrier::expect_nb(bar+smem_stage, WS*sizeof(__nv_bfloat16));
                     cp_async::load(smem_up.w + smem_stage*WS, &map_w, bar+smem_stage, offs, expert_idx*N + blockIdx.x*WN*BN);
                 }
                 ++smem_stage;
@@ -134,7 +133,7 @@ namespace pi {
                 }
                 barrier::await(bar+STAGES+smem_stage, phase);
                 if (!threadIdx.x) {
-                    barrier::expect_nb(bar+smem_stage, WS*sizeof(bf16_t));
+                    barrier::expect_nb(bar+smem_stage, WS*sizeof(__nv_bfloat16));
                     cp_async::load(smem_down.w + smem_stage*WS, &map_w2, bar+smem_stage, blockIdx.x*BK2, expert_idx*N2 + stage*BN2);
                 }
                 barrier::arrive_cp_async_mem(bar+smem_stage);
@@ -162,8 +161,8 @@ namespace pi {
                 cuda::ptx::fence_proxy_async(cuda::ptx::space_shared);
                 warp_group::arrive();
                 for (int32_t i=0; i < TN; ++i) {
-                    bf16_t *sw = smem_up.w + smem_stage*WS + (warp_id>>2)*(BN<<2)*BK + (i<<6)*BK;
-                    bf16_t *sx = smem_up.x + smem_stage*XS;
+                    __nv_bfloat16 *sw = smem_up.w + smem_stage*WS + (warp_id>>2)*(BN<<2)*BK + (i<<6)*BK;
+                    __nv_bfloat16 *sx = smem_up.x + smem_stage*XS;
                     uint64_t desc_w = smem_desc_encode<64, 1, SWIZZLE_MODE_UP>(sw);
                     uint64_t desc_x = smem_desc_encode<64, 1, SWIZZLE_MODE_UP>(sx);
                     wgmma::wgmma<1, 1, 1, BM>(tile[i], desc_w, desc_x);
@@ -183,26 +182,83 @@ namespace pi {
             }
             con_sync();
             auto &smem_down = *reinterpret_cast<smem_down_pod<STAGES, WN, BM, BK, BN> *>(smem_raw);
-            auto *block_max = reinterpret_cast<float4 *>(smem_down.out);
-            static constexpr float EPS = 1e-10f;
-            float tmax[TM] = {EPS, EPS};
             for (int32_t tn=0; tn < TN; ++tn)
             for (int32_t tm=0; tm < TM; ++tm) {
                 facc[tn][tm][0].x = swiglu(facc[tn][tm][0].x, facc[tn][tm][1].x);
                 facc[tn][tm][0].y = swiglu(facc[tn][tm][0].y, facc[tn][tm][1].y);
-                tmax[tm] = __fmax2(tmax[tm], __fabs2(facc[tn][tm][0]));
             }
+            con_sync();
             for (int32_t tm=0; tm < TM; ++tm) {
-                tmax[tm] = __fmax2(__shfl_xor_sync(~0u, tmax[tm], 16), tmax[tm]);
-                tmax[tm] = __fmax2(__shfl_xor_sync(~0u, tmax[tm], 8), tmax[tm]);
-                tmax[tm] = __fmax2(__shfl_xor_sync(~0u, tmax[tm], 4), tmax[tm]);
-                if (lane_id < 4) {
-                    auto offs = (tm<<3) + (lane_id<<1);
-                    reinterpret_cast<float2 *>(block_max + offs*WARP_GROUPS)[warp_id] = tmax[tm];
+                #pragma unroll
+                for (int32_t t=0; t < 2; ++t)
+                for (int32_t tn=0; tn < TN; ++tn) {
+                    float xi = !t ? facc[tn][tm][0].x : facc[tn][tm][0].y;
+                    int32_t x_row = (tm<<3) + ((lane_id&3)<<1) + t;
+                    int32_t x_col = (warp_id>>1)*(TN<<5) + (tn<<5) + ((warp_id&3)<<3) + (lane_id>>2);
+                    smem_down.x[swizzle<SWIZZLE_BITS_DOWN>(x_row*BK2 + x_col)] = __float2bfloat16(xi);
                 }
             }
             con_sync();
-            
+            for (int32_t stage=0; stage < n_stages_down; ++stage) {
+                if (smem_stage == STAGES) {
+                    phase ^= 1;
+                    smem_stage = 0;
+                }
+                float s_2[TN2>>1] = {};
+                float tile[TN2][TM][4] = {};
+                __nv_bfloat16 *sx = smem_down.x;
+                barrier::await(bar+smem_stage, phase);
+                #pragma unroll
+                for (int i=0; i < TN2; ++i)
+                    for (int j=0; j < TM; ++j)
+                        for (int k=0; k < 4; ++k)
+                            asm volatile ("f" : "+f"(tile[i][j][k]) :: "memory");
+                warp_group::arrive();
+                for (int32_t tn2=0; tn2 < TN2; ++tn2) {
+                    __nv_bfloat16 *sw = smem_down.w + smem_stage*WS + (((warp_id>>2)*TN2 + tn2)<<6)*BK2;
+                    uint64_t desc_w = smem_desc_encode<BK2/2, 1, 1, SWIZZLE_MODE_DOWN>(sw);
+                    uint64_t desc_x = smem_desc_encode<BK2/2, 1, 1, SWIZZLE_MODE_DOWN>(sx);
+                    #pragma unroll
+                    for (int32_t tk=0; tk < BK2>>5; ++tk) {
+                        wgmma::wgmma<1, 1, 1, BM>(tile[tn2], desc_w, desc_x);
+                        desc_w += 32>>4;
+                        desc_x += 32>>4;
+                    }
+                }
+                warp_group::commit_batch();
+                warp_group::await();
+                barrier::arrive(bar+STAGES+smem_stage);
+                __nv_bfloat16 out_tile[TN2>>1][TM][8];
+                for (int32_t tn2=0; tn2 < TN2; ++tn2)
+                for (int32_t tm=0; tm < TM; ++tm)
+                for (int32_t t=0; t < 8; ++t)
+                    out_tile[tn2>>1][tm][t] = tile[tn2 + (t>>2)][tm][t&3];
+                asm volatile ("cp.async.bulk.wait_group 0;\n");
+                cuda::ptx::fence_proxy_async(cuda::ptx::space_shared);
+                con_sync();
+                for (int32_t tn2=0; tn2 < TN2; ++tn2)
+                for (int32_t tm=0; tm < TM; ++tm) {
+                    int32_t o_row = (tm<<3) + (lane_id&7);
+                    int32_t o_col = (warp_id>>2)*(TN2<<6) + ((warp_id&3)<<4) + (lane_id&8) + (tn2<<6) + ((lane_id>>4)<<6);
+                    ls_matrix::store4<true>(reinterpret_cast<uint32_t *>(out_tile[tn2>>1][tm]), __cvta_generic_to_shared(smem_down.out + o_row*PAD + o_col));
+                }
+                cuda::ptx::fence_proxy_async(cuda::ptx::space_shared);
+                con_sync();
+                if (threadIdx.x < PRODUCER_THREADS+BM) {
+                    if (tok_src < M) {
+                        cuda::ptx::cp_reduce_async_bulk(
+                            cuda::ptx::space_global,
+                            cuda::ptx::space_shared,
+                            cuda::ptx::op_add,
+                            out + tok_src*N2 + stage*BN2,
+                            smem_down.out + PAD*(threadIdx.x-PRODUCER_THREADS),
+                            BN2*sizeof(__nv_bfloat16)
+                        );
+                    }
+                    cuda::ptx::cp_async_bulk_commit_group();
+                }
+                ++smem_stage;
+            }
          };
         if (is_prod) producer();
         else consumer();
