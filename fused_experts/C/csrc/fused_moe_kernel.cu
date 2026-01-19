@@ -1,9 +1,14 @@
 #include "common.cuh"
 
 #include <mma.h>
+#include <cuda/ptx>
 
 namespace pi {
     using bf16_t = __nv_bfloat16;
+
+    [[nodiscard]] static __device__ __forceinline__ float swiglu(float x, float w) {
+        return w*(x/(1.f+__expf(-x)));
+    }
 
     template <const int32_t STAGES, const int32_t WN, const int32_t BM, const int32_t BK, const int32_t BN>
     struct smem_up_pod {
@@ -57,6 +62,8 @@ namespace pi {
         __shared__ __align__(8) uint64_t bar[STAGES<<1];
         __shared__ float topk_scales[BM];
 
+        auto &smem_up = *reinterpret_cast<smem_up_pod<STAGES, WN, BM, BK, BN> *>(smem_raw);
+
         int32_t warp_m = blockIdx.y;
         int32_t expert_idx = expert_idxs[warp_m];
         if (BM*warp_m >= *num_tokens_post_padded) return;
@@ -76,10 +83,9 @@ namespace pi {
         auto con_sync = [=]() { asm volatile ("bar.sync 0, %0;\n" :: "n"(CONSUMER_THREADS)); };
         int32_t n_stages_up = K / *BLOCK_SHAPE;
         int32_t n_stages_down = N2/BN2;
-        float facc[TN][TM][4] = {};
+        float2 facc[TN][TM][4] = {};
         int32_t phase = 0;
-        if (is_prod) {
-            auto &smem_up = *reinterpret_cast<smem_up_pod<STAGES, WN, BM, BK, BN> *>(smem_raw);
+        const auto producer = [&] {
             int32_t tsrc[X_IT];
             int32_t i = threadIdx.x*TO;
             for (int32_t r=0; r < X_IT; ++r) {
@@ -134,8 +140,72 @@ namespace pi {
                 barrier::arrive_cp_async_mem(bar+smem_stage);
                 ++smem_stage;
             }
-        } else {
-        }
+        };
+        const auto consumer = [&] {
+            int32_t tok_src = M;
+            if (threadIdx.x < PRODUCER_THREADS+BM)
+                tok_src = sorted_token_ids[warp_m*BM + threadIdx.x-PRODUCER_THREADS]/top_k;
+            for (int32_t i=0; i < STAGES; ++i) barrier::arrive(bar+STAGES+i);
+            int32_t smem_stage = 0;
+            for (int32_t stage=0; stage < n_stages_up; ++stage) {
+                if (smem_stage == STAGES) {
+                    phase ^= 1;
+                    smem_stage = 0;
+                }
+                barrier::await(bar+smem_stage, phase);
+                float tile[TN][TM][4] = {};
+                #pragma unroll
+                for (int i=0; i < TN; ++i)
+                    for (int j=0; j < TM; ++j)
+                        for (int k=0; k < 4; ++k)
+                            asm volatile ("f" : "+f"(tile[i][j][k]) :: "memory");
+                cuda::ptx::fence_proxy_async(cuda::ptx::space_shared);
+                warp_group::arrive();
+                for (int32_t i=0; i < TN; ++i) {
+                    bf16_t *sw = smem_up.w + smem_stage*WS + (warp_id>>2)*(BN<<2)*BK + (i<<6)*BK;
+                    bf16_t *sx = smem_up.x + smem_stage*XS;
+                    uint64_t desc_w = smem_desc_encode<64, 1, SWIZZLE_MODE_UP>(sw);
+                    uint64_t desc_x = smem_desc_encode<64, 1, SWIZZLE_MODE_UP>(sx);
+                    wgmma::wgmma<1, 1, 1, BM>(tile[i], desc_w, desc_x);
+                    wgmma::wgmma<1, 1, 1, BM>(tile[i], desc_w+1*(32>>4), desc_x+1*(32>>4));
+                    wgmma::wgmma<1, 1, 1, BM>(tile[i], desc_w+2*(32>>4), desc_x+2*(32>>4));
+                    wgmma::wgmma<1, 1, 1, BM>(tile[i], desc_w+3*(32>>4), desc_x+3*(32>>4));
+                }
+                warp_group::commit_batch();
+                warp_group::await();
+                barrier::arrive(bar+STAGES+smem_stage);
+                for (int32_t tm=0; tm < TM; ++tm)
+                for (int32_t tn=0; tn < TN; ++tn) {
+                    facc[tn][tm][0] += float2(tile[tn][tm][0], tile[tn][tm][1]);
+                    facc[tn][tm][1] += float2(tile[tn][tm][2], tile[tn][tm][3]);
+                }
+                ++smem_stage;
+            }
+            con_sync();
+            auto &smem_down = *reinterpret_cast<smem_down_pod<STAGES, WN, BM, BK, BN> *>(smem_raw);
+            auto *block_max = reinterpret_cast<float4 *>(smem_down.out);
+            static constexpr float EPS = 1e-10f;
+            float tmax[TM] = {EPS, EPS};
+            for (int32_t tn=0; tn < TN; ++tn)
+            for (int32_t tm=0; tm < TM; ++tm) {
+                facc[tn][tm][0].x = swiglu(facc[tn][tm][0].x, facc[tn][tm][1].x);
+                facc[tn][tm][0].y = swiglu(facc[tn][tm][0].y, facc[tn][tm][1].y);
+                tmax[tm] = __fmax2(tmax[tm], __fabs2(facc[tn][tm][0]));
+            }
+            for (int32_t tm=0; tm < TM; ++tm) {
+                tmax[tm] = __fmax2(__shfl_xor_sync(~0u, tmax[tm], 16), tmax[tm]);
+                tmax[tm] = __fmax2(__shfl_xor_sync(~0u, tmax[tm], 8), tmax[tm]);
+                tmax[tm] = __fmax2(__shfl_xor_sync(~0u, tmax[tm], 4), tmax[tm]);
+                if (lane_id < 4) {
+                    auto offs = (tm<<3) + (lane_id<<1);
+                    reinterpret_cast<float2 *>(block_max + offs*WARP_GROUPS)[warp_id] = tmax[tm];
+                }
+            }
+            con_sync();
+            
+         };
+        if (is_prod) producer();
+        else consumer();
     }
 
 }
