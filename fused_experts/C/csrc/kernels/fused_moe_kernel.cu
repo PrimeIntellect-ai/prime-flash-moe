@@ -398,7 +398,7 @@ namespace pi {
             );
         }
 
-        template <const int bm>
+        template <const int32_t bm>
         __device__ __forceinline__ void wgmma(float r[bm>>3][4], uint64_t desc_a, uint64_t desc_b) {
             static_assert(bm >= 8 && bm <= 128 && !(bm & 7));
             if constexpr (bm == 8)   mm8  (r, desc_a, desc_b);
@@ -447,7 +447,7 @@ namespace pi {
     }
 
     namespace cp_async {
-        __device__ __forceinline__ void load(void *dst, const void *tma_map, uint64_t *bar, int row, int col) {
+        __device__ __forceinline__ void load(void *dst, const void *tma_map, uint64_t *bar, int32_t row, int32_t col) {
             static_assert(sizeof(void *) == sizeof(uint64_t));
             auto ptma = reinterpret_cast<uint64_t>(tma_map);
             auto pmbar = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
@@ -460,12 +460,12 @@ namespace pi {
             );
         }
 
-        template <const int nb, typename t_dst, typename t_src>
+        template <const int32_t nb, typename t_dst, typename t_src>
         __device__ __forceinline__ void cg256(t_dst dst, t_src src) {
             asm volatile("cp.async.cg.shared.global.L2::256B [%0], [%1], %2;\n" :: "r"(dst), "l"(src), "n"(nb));
         }
 
-        template <const int nb, typename t_dst, typename t_src>
+        template <const int32_t nb, typename t_dst, typename t_src>
         __device__ __forceinline__ void cg64(t_dst dst, t_src src) {
             asm volatile("cp.async.ca.shared.global.L2::64B [%0], [%1], %2;\n" :: "r"(dst), "l"(src), "n"(nb));
         }
@@ -474,14 +474,14 @@ namespace pi {
             asm volatile("cp.async.commit_group;\n" ::: "memory");
         }
 
-        template <const int n>
+        template <const int32_t n>
         __device__ __forceinline__ void await_group() {
             asm volatile("cp.async.wait_group %0;\n" :: "n"(n));
         }
     }
 
     namespace barrier {
-        __device__ __forceinline__ void init(uint64_t *bar, int threads, int transactions) {
+        __device__ __forceinline__ void init(uint64_t *bar, int32_t threads, int32_t transactions) {
             asm volatile(
                 "mbarrier.init.shared::cta.b64 [%0], %1;\n"
                 :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(bar))), "r"(threads+transactions)
@@ -510,7 +510,7 @@ namespace pi {
             );
         }
 
-        __device__ __forceinline__ void await(uint64_t *bar, int phase) {
+        __device__ __forceinline__ void await(uint64_t *bar, int32_t phase) {
             asm volatile(
                 "{\n"
                 ".reg .pred P1;\n"
@@ -732,9 +732,9 @@ namespace pi {
                 barrier::await(bar+smem_stage, phase);
                 float tile[TN][TM][4] = {};
                 #pragma unroll
-                for (int i=0; i < TN; ++i)
-                    for (int j=0; j < TM; ++j)
-                        for (int k=0; k < 4; ++k)
+                for (int32_t i=0; i < TN; ++i)
+                    for (int32_t j=0; j < TM; ++j)
+                        for (int32_t k=0; k < 4; ++k)
                             asm volatile ("" : "+f"(tile[i][j][k]) :: "memory");
                 cuda::ptx::fence_proxy_async(cuda::ptx::space_shared);
                 warp_group::arrive();
@@ -788,9 +788,9 @@ namespace pi {
                 __nv_bfloat16 *sx = smem_down.x;
                 barrier::await(bar+smem_stage, phase);
                 #pragma unroll
-                for (int i=0; i < TN2; ++i)
-                    for (int j=0; j < TM; ++j)
-                        for (int k=0; k < 4; ++k)
+                for (int32_t i=0; i < TN2; ++i)
+                    for (int32_t j=0; j < TM; ++j)
+                        for (int32_t k=0; k < 4; ++k)
                             asm volatile ("" : "+f"(tile[i][j][k]) :: "memory");
                 warp_group::arrive();
                 for (int32_t tn2=0; tn2 < TN2; ++tn2) {
@@ -846,8 +846,8 @@ namespace pi {
     template <const int32_t BM, const int32_t BN, const int32_t WN, const int32_t STAGES>
     static void launch_fused_moe_kernel(
         const __nv_bfloat16 *x,
-        __nv_bfloat16 *w,
-        __nv_bfloat16 *w2,
+        const __nv_bfloat16 *w,
+        const __nv_bfloat16 *w2,
         __nv_bfloat16 *out,
         const int32_t *sorted_token_ids,
         const int32_t *expert_idxs,
@@ -885,7 +885,7 @@ namespace pi {
                 &map_w,
                 CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT16,
                 rank,
-                w,
+                const_cast<__nv_bfloat16 *>(w),
                 shape,
                 strides,
                 box,
@@ -911,7 +911,7 @@ namespace pi {
                 &map_w2,
                 CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT16,
                 rank,
-                w2,
+                const_cast<__nv_bfloat16 *>(w2),
                 shape,
                 strides,
                 box,
@@ -942,8 +942,8 @@ namespace pi {
     static void dispatch_stages(
         int32_t stages,
         const __nv_bfloat16 *x,
-        __nv_bfloat16 *w,
-        __nv_bfloat16 *w2,
+        const __nv_bfloat16 *w,
+        const __nv_bfloat16 *w2,
         __nv_bfloat16 *out,
         const int32_t *sorted_token_ids,
         const int32_t *expert_idxs,
@@ -974,8 +974,8 @@ namespace pi {
         int32_t wn,
         int32_t stages,
         const __nv_bfloat16 *x,
-        __nv_bfloat16 *w,
-        __nv_bfloat16 *w2,
+        const __nv_bfloat16 *w,
+        const __nv_bfloat16 *w2,
         __nv_bfloat16 *out,
         const int32_t *sorted_token_ids,
         const int32_t *expert_idxs,
@@ -999,8 +999,8 @@ namespace pi {
 
     void fused_moe_bf16(
         const __nv_bfloat16 *x,
-        __nv_bfloat16 *w,
-        __nv_bfloat16 *w2,
+        const __nv_bfloat16 *w,
+        const __nv_bfloat16 *w2,
         __nv_bfloat16 *out,
         const int32_t *sorted_token_ids,
         const int32_t *expert_idxs,
