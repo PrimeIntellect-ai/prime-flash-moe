@@ -54,7 +54,6 @@ namespace pi {
         static constexpr int X_IT = const_ceil(XS/static_cast<float>(PRODUCER_THREADS*TO));
 
         extern __shared__ __align__(1024) uint8_t smem_raw[];
-        auto &smem_up = *reinterpret_cast<smem_up_pod<STAGES, WN, BM, BK, BN> *>(smem_raw);
         __shared__ __align__(8) uint64_t bar[STAGES<<1];
         __shared__ float topk_scales[BM];
 
@@ -77,10 +76,10 @@ namespace pi {
         auto con_sync = [=]() { asm volatile ("bar.sync 0, %0;\n" :: "n"(CONSUMER_THREADS)); };
         int32_t n_stages_up = K / *BLOCK_SHAPE;
         int32_t n_stages_down = N2/BN2;
-        float facc[TN][TM][4];
-        memset(facc, 0, sizeof(facc));
+        float facc[TN][TM][4] = {};
         int32_t phase = 0;
         if (is_prod) {
+            auto &smem_up = *reinterpret_cast<smem_up_pod<STAGES, WN, BM, BK, BN> *>(smem_raw);
             int32_t tsrc[X_IT];
             int32_t i = threadIdx.x*TO;
             for (int32_t r=0; r < X_IT; ++r) {
@@ -95,7 +94,6 @@ namespace pi {
                 i += PRODUCER_THREADS*TO;
             }
             int32_t smem_stage = 0;
-            int32_t w_row_up = expert_idx*N + blockIdx.x*WN*BN;
             for (int32_t stage=0; stage < n_stages_up; ++stage) {
                 if (smem_stage == STAGES) {
                     phase ^= 1;
@@ -118,11 +116,24 @@ namespace pi {
                 barrier::arrive_cp_async_mem(bar+smem_stage);
                 if (!threadIdx.x) {
                     barrier::expect_nb(bar+smem_stage, WS*sizeof(bf16_t));
-                    cp_async::load(smem_up.w + smem_stage*WS, &map_w, bar+smem_stage, w_row_up, offs);
+                    cp_async::load(smem_up.w + smem_stage*WS, &map_w, bar+smem_stage, offs, expert_idx*N + blockIdx.x*WN*BN);
                 }
                 ++smem_stage;
             }
-            // TODO: s
+            auto &smem_down = *reinterpret_cast<smem_down_pod<STAGES, WN, BM, BK, BN> *>(smem_raw);
+            for (int32_t stage=0; stage < n_stages_up; ++stage) {
+                if (smem_stage == STAGES) {
+                    phase ^= 1;
+                    smem_stage = 0;
+                }
+                barrier::await(bar+STAGES+smem_stage, phase);
+                if (!threadIdx.x) {
+                    barrier::expect_nb(bar+smem_stage, WS*sizeof(bf16_t));
+                    cp_async::load(smem_down.w + smem_stage*WS, &map_w2, bar+smem_stage, blockIdx.x*BK2, expert_idx*N2 + stage*BN2);
+                }
+                barrier::arrive_cp_async_mem(bar+smem_stage);
+                ++smem_stage;
+            }
         } else {
         }
     }
