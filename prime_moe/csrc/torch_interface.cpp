@@ -61,13 +61,13 @@ namespace pi {
         TORCH_CHECK(num_tokens_post_padded.is_contiguous());
         TORCH_CHECK(topk_weights.is_contiguous());
         TORCH_CHECK(out.is_contiguous());
-        TORCH_CHECK(x.dtype() == torch::kFloat16);
-        TORCH_CHECK(w.dtype() == torch::kFloat16);
-        TORCH_CHECK(w2.dtype() == torch::kFloat16);
+        TORCH_CHECK(x.dtype() == torch::kBFloat16);
+        TORCH_CHECK(w.dtype() == torch::kBFloat16);
+        TORCH_CHECK(w2.dtype() == torch::kBFloat16);
         TORCH_CHECK(sorted_token_ids.dtype() == torch::kInt32);
         TORCH_CHECK(expert_ids.dtype() == torch::kInt32);
         TORCH_CHECK(num_tokens_post_padded.dtype() == torch::kInt32);
-        TORCH_CHECK(out.dtype() == torch::kFloat16);
+        TORCH_CHECK(out.dtype() == torch::kBFloat16);
         fused_moe_bf16(
             static_cast<const __nv_bfloat16 *>(x.const_data_ptr()),
             static_cast<const __nv_bfloat16 *>(w.const_data_ptr()),
@@ -92,7 +92,7 @@ namespace pi {
     }
 }
 
-TORCH_LIBRARY_FRAGMENT(prime_fused_moe, m) {
+TORCH_LIBRARY_FRAGMENT(prime_moe, m) {
     m.def("fused_moe_bf16("
         "Tensor x, "
         "Tensor w, "
@@ -112,4 +112,4 @@ TORCH_LIBRARY_FRAGMENT(prime_fused_moe, m) {
     m.impl("fused_moe_bf16", torch::kCUDA, &pi::fused_moe_bf16_torch_stub);
 }
 
-PYBIND11_MODULE(prime_fused_moe, m) {}
+PYBIND11_MODULE(_C, m) {}

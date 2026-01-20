@@ -11,7 +11,7 @@ requires = [
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "fused-experts"
+name = "prime_moe"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"

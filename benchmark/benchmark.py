@@ -1,6 +1,6 @@
 import time
 import torch
-import fused_experts as fe
+import prime_moe as fe
 import matplotlib.pyplot as plt
 
 LBS = 6
