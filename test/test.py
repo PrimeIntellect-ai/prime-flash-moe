@@ -1,17 +1,5 @@
 import prime_moe
 import torch
-import triton.language as tl
-
-from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
-    moe_align_block_size,
-    try_get_optimal_moe_config,
-)
-from sglang.srt.server_args import set_global_server_args_for_scheduler
-
-class FakeServerArgs:
-    enable_deterministic_inference=False
-
-set_global_server_args_for_scheduler(FakeServerArgs())
 
 def moe_naive(x: torch.Tensor, wgT: torch.Tensor, wuT: torch.Tensor, wdT: torch.Tensor, offs: torch.Tensor) -> torch.Tensor:
     gate_proj = torch._grouped_mm(
@@ -39,6 +27,76 @@ H = 4096
 M = 3072
 E = 16
 
+import torch
+
+def moe_align_block_size_simple(topk_ids: torch.Tensor, block_size_m: int, num_experts: int):
+    """
+    topk_ids: int tensor [T, top_k], each entry in [0, num_experts)
+    Returns:
+      sorted_token_ids: int32 [T_padded]
+      expert_ids: int32 [num_blocks]
+      num_tokens_post_padded: int32 scalar tensor
+    """
+    assert topk_ids.dim() == 2
+    device = topk_ids.device
+    T, top_k = topk_ids.shape
+
+    # Flatten into token/expert pairs
+    token_ids = torch.arange(T, device=device, dtype=torch.int32)
+    token_ids = token_ids[:, None].expand(T, top_k).reshape(-1)      # [T*top_k]
+    expert_flat = topk_ids.reshape(-1).to(torch.int32)               # [T*top_k]
+
+    # Sort by expert so tokens are grouped per expert
+    sort_idx = torch.argsort(expert_flat)                            # [T*top_k]
+    expert_sorted = expert_flat[sort_idx]
+    token_sorted  = token_ids[sort_idx]
+
+    # Count how many pairs per expert
+    counts = torch.bincount(expert_sorted, minlength=num_experts)    # [E]
+
+    # Pad each expert's segment up to multiple of block_size_m
+    padded_counts = ((counts + block_size_m - 1) // block_size_m) * block_size_m
+    total_padded = int(padded_counts.sum().item())
+
+    # Output buffers
+    sorted_token_ids = torch.empty((total_padded,), device=device, dtype=torch.int32)
+
+    # expert_ids: one per block
+    num_blocks = int((padded_counts // block_size_m).sum().item())
+    expert_ids = torch.empty((num_blocks,), device=device, dtype=torch.int32)
+
+    # Fill per-expert segments
+    write_ptr = 0
+    block_ptr = 0
+
+    # We need start offsets in the sorted list for each expert
+    # Compute segment boundaries via prefix sum of counts
+    # (counts is per expert, but expert_sorted is grouped already)
+    # We'll walk experts in order 0..E-1
+    # and consume counts[e] elements from token_sorted sequentially.
+    read_ptr = 0
+    for e in range(num_experts):
+        c = int(counts[e].item())
+        pc = int(padded_counts[e].item())
+
+        if c > 0:
+            sorted_token_ids[write_ptr : write_ptr + c] = token_sorted[read_ptr : read_ptr + c]
+        # pad with -1 sentinel (common choice) for empty slots
+        if pc > c:
+            sorted_token_ids[write_ptr + c : write_ptr + pc] = -1
+
+        # write expert id per block
+        nb = pc // block_size_m
+        if nb > 0:
+            expert_ids[block_ptr : block_ptr + nb] = e
+            block_ptr += nb
+
+        write_ptr += pc
+        read_ptr += c
+
+    num_tokens_post_padded = torch.tensor([total_padded], device=device, dtype=torch.int32)
+    return sorted_token_ids, expert_ids, num_tokens_post_padded
+
 def interleave_tensor(tensor, rep=8):
     M, N, K = tensor.shape
     first_half = tensor[:, :(N//2), :]
@@ -51,8 +109,8 @@ def interleave_tensor(tensor, rep=8):
 
 
 def generate_topk_ids(num_experts, num_tokens, top_k, balancedness=1.0):
-    uniform = torch.ones(num_experts) / num_experts
-    skewed = torch.zeros(num_experts)
+    uniform = torch.ones(num_experts, device='cuda:0') / num_experts
+    skewed = torch.zeros(num_experts, device='cuda:0')
     skewed[0] = 1.0
     probs = balancedness * uniform + (1 - balancedness) * skewed
     topk_ids = torch.multinomial(probs, num_tokens * top_k, replacement=True)
@@ -74,25 +132,32 @@ for block_m in range(8, 129, 8):
                 continue
             configs.append((block_m, bn, wn, stages))
 
+def pick_block_size_m(num_tokens: int):
+    if num_tokens <= 32: return 32
+    if num_tokens <= 64: return 64
+    return 128
+
 for E in e_vals:
         for N in n_vals:
             for K in k_vals:
                 for num_tokens in batch_sizes:
                     for block_m, bn, wn, stages in configs:
-                        x = torch.empty((num_tokens, K), dtype=torch.bfloat16).normal_(mean=0, std=0.05).to('cuda:0')
-                        w1 = (torch.randn((E, N, K)) * 50).to('cuda:0')
-                        w2 = (torch.randn((E, K, N // 2)) * 50).to('cuda:0')
-                        topk_ids = generate_topk_ids(E-1, num_tokens, top_k-1).to('cuda:0')
-                        topk_ids = torch.hstack((topk_ids, torch.ones(num_tokens).view(num_tokens,1).to(torch.int32)*(E-1))).to('cuda:0')
-                        topk_weights = torch.nn.functional.softmax(torch.randn((num_tokens, top_k), dtype=torch.float32), dim=-1).to('cuda:0')
+                        x = torch.empty((num_tokens, K), dtype=torch.bfloat16, device='cuda:0').normal_(mean=0, std=0.05)
+                        w1 = torch.randn((E, N, K), device='cuda:0') * 50
+                        w2 = torch.randn((E, K, N // 2), device='cuda:0') * 50
+                        topk_ids = generate_topk_ids(E-1, num_tokens, top_k-1)
+                        topk_ids = torch.hstack((topk_ids, torch.ones(num_tokens, device='cuda:0').view(num_tokens,1).to(torch.int32)*(E-1)))
+                        topk_weights = torch.nn.functional.softmax(torch.randn((num_tokens, top_k), dtype=torch.float32, device='cuda:0'), dim=-1)
                         out = torch.zeros_like(x).to('cuda:0')
-                        triton_config = try_get_optimal_moe_config(w1.shape, w2.shape, top_k, 'bfloat16', block_shape=block_shape, M=num_tokens)
-                        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-                            topk_ids, triton_config["BLOCK_SIZE_M"], E
+                        block_size_m = pick_block_size_m(num_tokens)
+                        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size_simple(
+                            topk_ids, block_size_m, E
                         )
-                        sorted_token_ids = sorted_token_ids.to('cuda:0')
-                        expert_ids = expert_ids.to('cuda:0')
-                        num_tokens_post_padded = num_tokens_post_padded.to('cuda:0')
+                        x = x.to(dtype=torch.bfloat16)
+                        w1 = w1.to(dtype=torch.bfloat16)
+                        w2 = w2.to(dtype=torch.bfloat16)
+                        topk_weights = topk_weights.to(dtype=torch.bfloat16)
+                        out = out.to(dtype=torch.bfloat16)
                         torch.ops.prime_moe.fused_moe_bf16(
                             x,
                             w1,

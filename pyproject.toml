@@ -21,7 +21,6 @@ dependencies = [
   "torch",
   "torchvision",
   "pytorch-triton",
-  "sglang>=0.5.2",
 ]
 
 [tool.uv.sources]
