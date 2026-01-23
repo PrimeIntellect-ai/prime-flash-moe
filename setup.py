@@ -12,7 +12,7 @@ if __name__ == "__main__":
 
 setuptools.setup(
     name="prime_moe",
-    packages=setuptools.find_packages(include=["prime_moe"]),
+    packages=setuptools.find_packages(include=["prime_moe.*"]),
     version="0.0.1",
     ext_modules=[CUDAExtension(name="prime_moe._C", sources=sources)],
     cmdclass={"build_ext": BuildExtension},

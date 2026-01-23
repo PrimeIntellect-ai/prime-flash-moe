@@ -1,33 +1,35 @@
 [build-system]
 requires = [
-    "setuptools",
-    "wheel",
-    "build",
-    "numpy",
-    "ninja",
-    "torch>=2.5",
-    "torchvision>=0.20",
+  "setuptools",
+  "wheel",
+  "build",
+  "numpy",
+  "ninja",
+  "torch",
+  "torchvision",
+  "pytorch-triton",
 ]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "prime_moe"
 version = "0.1.0"
-description = "Add your description here"
-readme = "README.md"
 requires-python = ">=3.12"
-
 dependencies = [
-    "setuptools",
-    "torch",
-    "numpy",
+  "setuptools",
+  "numpy",
+  "torch",
+  "torchvision",
+  "pytorch-triton",
+  "sglang>=0.5.2",
 ]
 
 [tool.uv.sources]
-torch = { index = "pytorch-cu130" }
-torchvision = { index = "pytorch-cu130" }
+torch = { index = "pytorch-nightly-cu130" }
+torchvision = { index = "pytorch-nightly-cu130" }
+pytorch-triton = { index = "pytorch-nightly-cu130" }
 
 [[tool.uv.index]]
-name = "pytorch-cu130"
-url = "https://download.pytorch.org/whl/cu130"
+name = "pytorch-nightly-cu130"
+url = "https://download.pytorch.org/whl/nightly/cu130"
 explicit = true
