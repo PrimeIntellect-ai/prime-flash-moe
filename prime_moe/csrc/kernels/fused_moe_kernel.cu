@@ -34,16 +34,16 @@ namespace pi {
         return ((static_cast<uint64_t>(__cvta_generic_to_shared(p)) & 0x3ffff)>>4) | (ldo<<16) | (sdo<<32) | (mode<<62);
     }
 
-    #if __CUDA_ARCH__ >= 12000
+    #if __CUDA_ARCH__ >= 1200
 
     namespace tcgen5 {
         [[nodiscard]] constexpr uint32_t encode_desc(uint32_t n, uint32_t m) {
             uint32_t desc = 0;
-            desc |= (1<<4);  // dtype=f32
-            desc |= (1<<7);  // atype=bf16
-            desc |= (1<<10;) // btype=bf16
-            desc |= block_n>>3<<17;
-            desc |= block_m>>4<<24;
+            desc |= 1<<4;  // dtype=f32
+            desc |= 1<<7;  // atype=bf16
+            desc |= 1<<10; // btype=bf16
+            desc |= n>>3<<17;
+            desc |= m>>4<<24;
             return desc;
         }
 
@@ -51,7 +51,7 @@ namespace pi {
             asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;\n"
                 :
                 :
-                "r"(__cvta_generic_to_shared(addr)),
+                "r"(static_cast<uint32_t>(__cvta_generic_to_shared(addr))),
                 "r"(nb)
             );
         }
@@ -60,7 +60,7 @@ namespace pi {
             asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 [%0], %1;\n"
                 :
                 :
-                "r"(__cvta_generic_to_shared(addr)),
+                "r"(static_cast<uint32_t>(__cvta_generic_to_shared(addr))),
                 "r"(nb)
             );
         }
@@ -69,11 +69,11 @@ namespace pi {
             asm volatile("tcgen05.fence::after_thread_sync;\n" ::: "memory");
         }
 
-        __device__ __forceinline__ void mbarrier_mma(void *bar) {
+        __device__ __forceinline__ void mbarrier_mma(uint64_t *bar) {
             asm volatile ("tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%0];\n"
                 :
                 :
-                "r"(bar)
+                "r"(static_cast<uint32_t>(__cvta_generic_to_shared(bar)))
                 : "memory"
             );
         }
