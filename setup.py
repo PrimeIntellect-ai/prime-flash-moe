@@ -3,7 +3,7 @@ import os
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 if __name__ == "__main__":
-    os.environ["TORCH_CUDA_ARCH_LIST"] = "9.0a"
+    os.environ["TORCH_CUDA_ARCH_LIST"] = "12.0"
 
     sources = [
         "./prime_moe/csrc/torch_interface.cpp",
