@@ -920,7 +920,7 @@ namespace pi {
         };
         if (cudaFuncSetAttribute(&fused_moe_kernel<BM, BK, BN, WN, STAGES, PRODUCER_THREADS>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM) != cudaSuccess)
             throw std::runtime_error {"Failed to set max dynamic shared memory size for fused_moe_kernel: " + std::to_string(SMEM) + " bytes"};
-        auto cuTensorMapEncodeTiled = getProcAddress_cuTensorMapEncodeTiled();
+        auto* cuTensorMapEncodeTiled = getProcAddress_cuTensorMapEncodeTiled();
         CUtensorMap map_w = {};
         {
             constexpr auto rank = 2;
@@ -942,6 +942,8 @@ namespace pi {
                 CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
                 CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
             );
+            if (res != CUDA_SUCCESS)
+                throw std::runtime_error {"Failed to encode tensor map: " + std::to_string(res)};
         }
         CUtensorMap map_w2 = {};
         {
@@ -968,6 +970,8 @@ namespace pi {
                 CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
                 CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
             );
+            if (res != CUDA_SUCCESS)
+                throw std::runtime_error {"Failed to encode tensor map: " + std::to_string(res)};
         }
         fused_moe_kernel<BM, BK, BN, WN, STAGES, PRODUCER_THREADS><<<grid, block, SMEM, stream>>>(
             x,

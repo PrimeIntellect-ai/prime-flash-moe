@@ -64,6 +64,7 @@ namespace pi {
         TORCH_CHECK(x.dtype() == torch::kBFloat16);
         TORCH_CHECK(w.dtype() == torch::kBFloat16);
         TORCH_CHECK(w2.dtype() == torch::kBFloat16);
+        TORCH_CHECK(topk_weights.dtype() == torch::kFloat32);
         TORCH_CHECK(sorted_token_ids.dtype() == torch::kInt32);
         TORCH_CHECK(expert_ids.dtype() == torch::kInt32);
         TORCH_CHECK(num_tokens_post_padded.dtype() == torch::kInt32);

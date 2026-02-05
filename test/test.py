@@ -139,21 +139,16 @@ def pick_block_size_m(num_tokens: int):
 
 def test_cfg(num_tokens, K, E, N, top_k, block_m, bn, wn, stages):
     x = torch.empty((num_tokens, K), dtype=torch.bfloat16, device='cuda:0').normal_(mean=0, std=0.05)
-    w1 = torch.randn((E, N, K), device='cuda:0') * 50
-    w2 = torch.randn((E, K, N // 2), device='cuda:0') * 50
+    w1 = torch.randn((E, N, K), dtype=torch.bfloat16, device='cuda:0') * 50
+    w2 = torch.randn((E, K, N // 2), dtype=torch.bfloat16, device='cuda:0') * 50
     topk_ids = generate_topk_ids(E-1, num_tokens, top_k-1)
     topk_ids = torch.hstack((topk_ids, torch.ones(num_tokens, device='cuda:0').view(num_tokens,1).to(torch.int32)*(E-1)))
     topk_weights = torch.nn.functional.softmax(torch.randn((num_tokens, top_k), dtype=torch.float32, device='cuda:0'), dim=-1)
-    out = torch.zeros_like(x).to('cuda:0')
+    out = torch.zeros_like(x, dtype=torch.bfloat16, device='cuda:0')
     block_size_m = pick_block_size_m(num_tokens)
     sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size_simple(
         topk_ids, block_size_m, E
     )
-    x = x.to(dtype=torch.bfloat16)
-    w1 = w1.to(dtype=torch.bfloat16)
-    w2 = w2.to(dtype=torch.bfloat16)
-    topk_weights = topk_weights.to(dtype=torch.bfloat16)
-    out = out.to(dtype=torch.bfloat16)
     torch.ops.prime_moe.fused_moe_bf16(
         x,
         w1,
@@ -169,11 +164,11 @@ def test_cfg(num_tokens, K, E, N, top_k, block_m, bn, wn, stages):
         wn,
         stages
     )
+    torch.cuda.synchronize()
     print(out)
 
-test_cfg(1024, 7168, 257, 256, 9, 128, 64, 4, 1)
-
-exit()
+#test_cfg(1024, 7168, 257, 256, 9, 128, 64, 4, 1)
+#exit()
 
 for E in e_vals:
         for N in n_vals:
