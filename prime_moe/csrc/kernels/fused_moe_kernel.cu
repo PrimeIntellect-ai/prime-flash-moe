@@ -1,4 +1,5 @@
 #include <stdexcept>
+#include <array>
 
 #include <mma.h>
 #include <cuda/ptx>
@@ -890,6 +891,36 @@ namespace pi {
         else consumer();
     }
 
+    template <const size_t rank>
+    [[nodiscard]] static CUtensorMap init_tmap(
+        const void *ptr,
+        const std::array<uint64_t, rank> &shape,
+        const std::array<uint64_t, rank> &strides,
+        const std::array<uint32_t, rank> &box,
+        const std::array<uint32_t, rank> &elem_strides,
+        CUtensorMapSwizzle swizzle
+    ) {
+        CUtensorMap map = {};
+        auto res = cuTensorMapEncodeTiled(
+            &map,
+            CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+            rank,
+            const_cast<void *>(ptr),
+            shape.data(),
+            strides.data(),
+            box.data(),
+            elem_strides.data(),
+            CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
+            swizzle,
+            CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+            CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
+        );
+        if (res != CUDA_SUCCESS)
+            throw std::runtime_error {"Failed to encode tensor map: " + std::to_string(res)};
+        return map;
+    }
+
+
     template <const int32_t BM, const int32_t BN, const int32_t WN, const int32_t STAGES>
     static void launch_fused_moe_kernel(
         const __nv_bfloat16 *x,
@@ -921,58 +952,22 @@ namespace pi {
         if (cudaFuncSetAttribute(&fused_moe_kernel<BM, BK, BN, WN, STAGES, PRODUCER_THREADS>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM) != cudaSuccess)
             throw std::runtime_error {"Failed to set max dynamic shared memory size for fused_moe_kernel: " + std::to_string(SMEM) + " bytes"};
         auto* cuTensorMapEncodeTiled = getProcAddress_cuTensorMapEncodeTiled();
-        CUtensorMap map_w = {};
-        {
-            constexpr auto rank = 2;
-            uint64_t shape[rank] = {static_cast<uint64_t>(K), static_cast<uint64_t>(N*num_experts)};
-            uint64_t strides[rank] = {K*sizeof(__nv_bfloat16)};
-            uint32_t box[rank] = {BK, BN*WN};
-            uint32_t elem_strides[rank] = {1, 1};
-            auto res = cuTensorMapEncodeTiled(
-                &map_w,
-                CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT16,
-                rank,
-                const_cast<__nv_bfloat16 *>(w),
-                shape,
-                strides,
-                box,
-                elem_strides,
-                CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
-                CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
-                CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
-                CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
-            );
-            if (res != CUDA_SUCCESS)
-                throw std::runtime_error {"Failed to encode tensor map: " + std::to_string(res)};
-        }
-        CUtensorMap map_w2 = {};
-        {
-            constexpr auto BK2 = (WN*BN)>>1;
-            constexpr auto BN2 = BK<<1;
-            auto K2 = N>>1;
-            auto N2 = K;
-            constexpr auto rank = 2;
-            uint64_t shape[rank] = {static_cast<uint64_t>(K2), static_cast<uint64_t>(N2*num_experts)};
-            uint64_t strides[rank] = {K2*sizeof(__nv_bfloat16)};
-            uint32_t box[rank] = {BK2, BN2};
-            uint32_t elem_strides[rank] = {1, 1};
-            auto res = cuTensorMapEncodeTiled(
-                &map_w2,
-                CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT16,
-                rank,
-                const_cast<__nv_bfloat16 *>(w2),
-                shape,
-                strides,
-                box,
-                elem_strides,
-                CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
-                WN*BN == 256 ? CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B : WN*BN == 128 ? CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_64B : CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_32B,
-                CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
-                CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
-            );
-            if (res != CUDA_SUCCESS)
-                throw std::runtime_error {"Failed to encode tensor map: " + std::to_string(res)};
-        }
+        CUtensorMap map_w = init_tmap<2>(
+            w,
+            {static_cast<uint64_t>(K), static_cast<uint64_t>(N*num_experts)},
+            {K*sizeof(__nv_bfloat16)},
+            {BK, BN*WN},
+            {1, 1},
+            CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B
+        );
+        CUtensorMap map_w2 = init_tmap<2>(
+            w2,
+            {static_cast<uint64_t>(N>>1), static_cast<uint64_t>(K*num_experts)},
+            {(N>>1)*sizeof(__nv_bfloat16)},
+            {(WN*BN)>>1, BK<<1},
+            {1, 1},
+            WN*BN == 256 ? CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B : WN*BN == 128 ? CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_64B : CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_32B
+        );
         fused_moe_kernel<BM, BK, BN, WN, STAGES, PRODUCER_THREADS><<<grid, block, SMEM, stream>>>(
             x,
             map_w,
