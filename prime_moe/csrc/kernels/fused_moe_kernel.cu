@@ -6,6 +6,10 @@
 #include <cuda.h>
 #include <cudaTypedefs.h>
 
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1000
+#error "Requires Blackwell SM100a (tcgen05)"
+#endif
+
 namespace pi {
     [[nodiscard]] static PFN_cuTensorMapEncodeTiled_v12000 getProcAddress_cuTensorMapEncodeTiled() {
         static PFN_cuTensorMapEncodeTiled_v12000 fn = nullptr;
@@ -35,34 +39,68 @@ namespace pi {
         return ((static_cast<uint64_t>(__cvta_generic_to_shared(p)) & 0x3ffff)>>4) | (ldo<<16) | (sdo<<32) | (mode<<62);
     }
 
-    #if __CUDA_ARCH__ >= 1200
+    [[nodiscard]] static __device__ __forceinline__ uint32_t lane_id() {
+        uint32_t r;
+        asm volatile("mov.u32 %0, %laneid;\n" : "=r"(r));
+        return r;
+    }
+
+    [[nodiscard]] static __device__ __forceinline__ uint32_t warp_id() {
+        uint32_t r;
+        asm volatile("mov.u32 %0, %warpid;\n" : "=r"(r));
+        return r;
+    }
 
     namespace tcgen5 {
-        [[nodiscard]] constexpr uint32_t encode_desc(uint32_t n, uint32_t m) {
-            uint32_t desc = 0;
-            desc |= 1<<4;  // dtype=f32
-            desc |= 1<<7;  // atype=bf16
-            desc |= 1<<10; // btype=bf16
-            desc |= n>>3<<17;
-            desc |= m>>4<<24;
-            return desc;
+        [[nodiscard]] __device__ __forceinline__ uint64_t desc_enc(int addr) {
+            return (static_cast<uint64_t>(addr)&0x3ffff)>>4;
         }
 
-        __device__ __forceinline__ void tmem_alloc(void *addr, int32_t nb) {
+        __device__ __forceinline__ void mma_f16(int addr, uint64_t desc_a, uint64_t desc_b, uint64_t desc_i, int enable_input_d) {
+            asm volatile(
+                "{\n"
+                ".reg .pred p;\n"
+                "setp.ne.b32 p, %4, 0;\n"
+                "tcgen05.mma.cta_group::1.kind.f16 [%0], %1, %2, %3m p;\n"
+                "}\n"
+                :
+                : "r"(addr), "l"(desc_a), "l"(desc_b), "r"(desc_i), "r"(enable_input_d)
+                : "memory"
+            );
+        }
+
+        __device__ __forceinline__ void commit_mbarrier(uint64_t *mbar) {
+            asm volatile(
+                "tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%0];\n"
+                :
+                : "r"(static_cast<uint32_t>(__cvta_generic_to_shared(mbar)))
+                : "memory"
+            );
+        }
+
+        __device__ __forceinline__ void fence_after_thread_sync() {
+            asm volatile("tcgen05.fence::after_thread_sync;\n" ::: "memory");
+        }
+
+        __device__ __forceinline__ void await_ld() {
+            asm volatile("tcgen05.wait::ld.sync.aligned;\n" ::: "memory");
+        }
+
+        __device__ __forceinline__ void tmem_alloc(void *addr, int32_t cols) {
             asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;\n"
                 :
                 :
                 "r"(static_cast<uint32_t>(__cvta_generic_to_shared(addr))),
-                "r"(nb)
+                "r"(cols)
             );
         }
         
-        __device__ __forceinline__ void tmem_free(void *addr, int32_t nb) {
+        __device__ __forceinline__ void tmem_free(void *addr, int32_t cols) {
             asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 [%0], %1;\n"
                 :
                 :
                 "r"(static_cast<uint32_t>(__cvta_generic_to_shared(addr))),
-                "r"(nb)
+                "r"(cols)
             );
         }
 
@@ -80,394 +118,6 @@ namespace pi {
         }
     }
 
-    #endif
-
-    namespace wgmma {
-        __device__ __forceinline__ void mm8(float r[1][4], uint64_t desc_a, uint64_t desc_b) {
-            asm volatile(
-                "{\n"
-                "wgmma.mma_async.sync.aligned.m64n8k16.f32.bf16.bf16 {%0, %1, %2, %3}, %4, %5, 1, 1, 1, 0, 0;\n"
-                "}\n"
-                : "+f"(r[0][0]), "+f"(r[0][1]), "+f"(r[0][2]), "+f"(r[0][3])
-                : "l"(desc_a), "l"(desc_b)
-            );
-        }
-
-        __device__ __forceinline__ void mm16(float r[2][4], uint64_t desc_a, uint64_t desc_b) {
-            asm volatile(
-                "{\n"
-                "wgmma.mma_async.sync.aligned.m64n16k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7}, %8, %9, 1, 1, 1, 0, 0;\n"
-                "}\n"
-                : "+f"(r[0][0]), "+f"(r[0][1]), "+f"(r[0][2]), "+f"(r[0][3]),
-                  "+f"(r[1][0]), "+f"(r[1][1]), "+f"(r[1][2]), "+f"(r[1][3])
-                : "l"(desc_a), "l"(desc_b)
-            );
-        }
-
-        __device__ __forceinline__ void mm24(float r[3][4], uint64_t desc_a, uint64_t desc_b) {
-            asm volatile(
-                "{\n"
-                "wgmma.mma_async.sync.aligned.m64n24k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11}, %12, %13, 1, 1, 1, 0, 0;\n"
-                "}\n"
-                : "+f"(r[0][0]), "+f"(r[0][1]), "+f"(r[0][2]), "+f"(r[0][3]),
-                  "+f"(r[1][0]), "+f"(r[1][1]), "+f"(r[1][2]), "+f"(r[1][3]),
-                  "+f"(r[2][0]), "+f"(r[2][1]), "+f"(r[2][2]), "+f"(r[2][3])
-                : "l"(desc_a), "l"(desc_b)
-            );
-        }
-
-        __device__ __forceinline__ void mm32(float r[4][4], uint64_t desc_a, uint64_t desc_b) {
-            asm volatile(
-                "{\n"
-                "wgmma.mma_async.sync.aligned.m64n32k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, %16, %17, 1, 1, 1, 0, 0;\n"
-                "}\n"
-                : "+f"(r[0][0]), "+f"(r[0][1]), "+f"(r[0][2]), "+f"(r[0][3]),
-                  "+f"(r[1][0]), "+f"(r[1][1]), "+f"(r[1][2]), "+f"(r[1][3]),
-                  "+f"(r[2][0]), "+f"(r[2][1]), "+f"(r[2][2]), "+f"(r[2][3]),
-                  "+f"(r[3][0]), "+f"(r[3][1]), "+f"(r[3][2]), "+f"(r[3][3])
-                : "l"(desc_a), "l"(desc_b)
-            );
-        }
-
-        __device__ __forceinline__ void mm40(float r[5][4], uint64_t desc_a, uint64_t desc_b) {
-            asm volatile(
-                "{\n"
-                "wgmma.mma_async.sync.aligned.m64n40k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19}, %20, %21, 1, 1, 1, 0, 0;\n"
-                "}\n"
-                : "+f"(r[0][0]), "+f"(r[0][1]), "+f"(r[0][2]), "+f"(r[0][3]),
-                  "+f"(r[1][0]), "+f"(r[1][1]), "+f"(r[1][2]), "+f"(r[1][3]),
-                  "+f"(r[2][0]), "+f"(r[2][1]), "+f"(r[2][2]), "+f"(r[2][3]),
-                  "+f"(r[3][0]), "+f"(r[3][1]), "+f"(r[3][2]), "+f"(r[3][3]),
-                  "+f"(r[4][0]), "+f"(r[4][1]), "+f"(r[4][2]), "+f"(r[4][3])
-                : "l"(desc_a), "l"(desc_b)
-            );
-        }
-
-        __device__ __forceinline__ void mm48(float r[6][4], uint64_t desc_a, uint64_t desc_b) {
-            asm volatile(
-                "{\n"
-                "wgmma.mma_async.sync.aligned.m64n48k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23}, %24, %25, 1, 1, 1, 0, 0;\n"
-                "}\n"
-                : "+f"(r[0][0]), "+f"(r[0][1]), "+f"(r[0][2]), "+f"(r[0][3]),
-                  "+f"(r[1][0]), "+f"(r[1][1]), "+f"(r[1][2]), "+f"(r[1][3]),
-                  "+f"(r[2][0]), "+f"(r[2][1]), "+f"(r[2][2]), "+f"(r[2][3]),
-                  "+f"(r[3][0]), "+f"(r[3][1]), "+f"(r[3][2]), "+f"(r[3][3]),
-                  "+f"(r[4][0]), "+f"(r[4][1]), "+f"(r[4][2]), "+f"(r[4][3]),
-                  "+f"(r[5][0]), "+f"(r[5][1]), "+f"(r[5][2]), "+f"(r[5][3])
-                : "l"(desc_a), "l"(desc_b)
-            );
-        }
-
-        __device__ __forceinline__ void mm56(float r[7][4], uint64_t desc_a, uint64_t desc_b) {
-            asm volatile(
-                "{\n"
-                "wgmma.mma_async.sync.aligned.m64n56k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27}, %28, %29, 1, 1, 1, 0, 0;\n"
-                "}\n"
-                : "+f"(r[0][0]), "+f"(r[0][1]), "+f"(r[0][2]), "+f"(r[0][3]),
-                  "+f"(r[1][0]), "+f"(r[1][1]), "+f"(r[1][2]), "+f"(r[1][3]),
-                  "+f"(r[2][0]), "+f"(r[2][1]), "+f"(r[2][2]), "+f"(r[2][3]),
-                  "+f"(r[3][0]), "+f"(r[3][1]), "+f"(r[3][2]), "+f"(r[3][3]),
-                  "+f"(r[4][0]), "+f"(r[4][1]), "+f"(r[4][2]), "+f"(r[4][3]),
-                  "+f"(r[5][0]), "+f"(r[5][1]), "+f"(r[5][2]), "+f"(r[5][3]),
-                  "+f"(r[6][0]), "+f"(r[6][1]), "+f"(r[6][2]), "+f"(r[6][3])
-                : "l"(desc_a), "l"(desc_b)
-            );
-        }
-
-        __device__ __forceinline__ void mm64(float r[8][4], uint64_t desc_a, uint64_t desc_b) {
-            asm volatile(
-                "{\n"
-                "wgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {"
-                    "%0 ,  %1,  %2,  %3, "
-                    "%4 ,  %5,  %6,  %7, "
-                    "%8 ,  %9, %10, %11, "
-                    "%12, %13, %14, %15, "
-                    "%16, %17, %18, %19, "
-                    "%20, %21, %22, %23, "
-                    "%24, %25, %26, %27, "
-                    "%28, %29, %30, %31  "
-                "}, %32, %33, 1, 1, 1, 0, 0;\n"
-                "}\n"
-                : "+f"(r[0][0]), "+f"(r[0][1]), "+f"(r[0][2]), "+f"(r[0][3]),
-                  "+f"(r[1][0]), "+f"(r[1][1]), "+f"(r[1][2]), "+f"(r[1][3]),
-                  "+f"(r[2][0]), "+f"(r[2][1]), "+f"(r[2][2]), "+f"(r[2][3]),
-                  "+f"(r[3][0]), "+f"(r[3][1]), "+f"(r[3][2]), "+f"(r[3][3]),
-                  "+f"(r[4][0]), "+f"(r[4][1]), "+f"(r[4][2]), "+f"(r[4][3]),
-                  "+f"(r[5][0]), "+f"(r[5][1]), "+f"(r[5][2]), "+f"(r[5][3]),
-                  "+f"(r[6][0]), "+f"(r[6][1]), "+f"(r[6][2]), "+f"(r[6][3]),
-                  "+f"(r[7][0]), "+f"(r[7][1]), "+f"(r[7][2]), "+f"(r[7][3])
-                : "l"(desc_a), "l"(desc_b)
-            );
-        }
-
-        __device__ __forceinline__ void mm72(float r[9][4], uint64_t desc_a, uint64_t desc_b) {
-            asm volatile(
-                "{\n"
-                "wgmma.mma_async.sync.aligned.m64n72k16.f32.bf16.bf16 {"
-                    "%0 ,  %1,  %2,  %3, "
-                    "%4 ,  %5,  %6,  %7, "
-                    "%8 ,  %9, %10, %11, "
-                    "%12, %13, %14, %15, "
-                    "%16, %17, %18, %19, "
-                    "%20, %21, %22, %23, "
-                    "%24, %25, %26, %27, "
-                    "%28, %29, %30, %31, "
-                    "%32, %33, %34, %35  "
-                "}, %36, %37, 1, 1, 1, 0, 0;\n"
-                "}\n"
-                : "+f"(r[0][0]), "+f"(r[0][1]), "+f"(r[0][2]), "+f"(r[0][3]),
-                  "+f"(r[1][0]), "+f"(r[1][1]), "+f"(r[1][2]), "+f"(r[1][3]),
-                  "+f"(r[2][0]), "+f"(r[2][1]), "+f"(r[2][2]), "+f"(r[2][3]),
-                  "+f"(r[3][0]), "+f"(r[3][1]), "+f"(r[3][2]), "+f"(r[3][3]),
-                  "+f"(r[4][0]), "+f"(r[4][1]), "+f"(r[4][2]), "+f"(r[4][3]),
-                  "+f"(r[5][0]), "+f"(r[5][1]), "+f"(r[5][2]), "+f"(r[5][3]),
-                  "+f"(r[6][0]), "+f"(r[6][1]), "+f"(r[6][2]), "+f"(r[6][3]),
-                  "+f"(r[7][0]), "+f"(r[7][1]), "+f"(r[7][2]), "+f"(r[7][3]),
-                  "+f"(r[8][0]), "+f"(r[8][1]), "+f"(r[8][2]), "+f"(r[8][3])
-                : "l"(desc_a), "l"(desc_b)
-            );
-        }
-
-        __device__ __forceinline__ void mm80(float r[10][4], uint64_t desc_a, uint64_t desc_b) {
-            asm volatile(
-                "{\n"
-                "wgmma.mma_async.sync.aligned.m64n80k16.f32.bf16.bf16 {"
-                    "%0 ,  %1,  %2,  %3, "
-                    "%4 ,  %5,  %6,  %7, "
-                    "%8 ,  %9, %10, %11, "
-                    "%12, %13, %14, %15, "
-                    "%16, %17, %18, %19, "
-                    "%20, %21, %22, %23, "
-                    "%24, %25, %26, %27, "
-                    "%28, %29, %30, %31, "
-                    "%32, %33, %34, %35, "
-                    "%36, %37, %38, %39  "
-                "}, %40, %41, 1, 1, 1, 0, 0;\n"
-                "}\n"
-                : "+f"(r[0][0]), "+f"(r[0][1]), "+f"(r[0][2]), "+f"(r[0][3]),
-                  "+f"(r[1][0]), "+f"(r[1][1]), "+f"(r[1][2]), "+f"(r[1][3]),
-                  "+f"(r[2][0]), "+f"(r[2][1]), "+f"(r[2][2]), "+f"(r[2][3]),
-                  "+f"(r[3][0]), "+f"(r[3][1]), "+f"(r[3][2]), "+f"(r[3][3]),
-                  "+f"(r[4][0]), "+f"(r[4][1]), "+f"(r[4][2]), "+f"(r[4][3]),
-                  "+f"(r[5][0]), "+f"(r[5][1]), "+f"(r[5][2]), "+f"(r[5][3]),
-                  "+f"(r[6][0]), "+f"(r[6][1]), "+f"(r[6][2]), "+f"(r[6][3]),
-                  "+f"(r[7][0]), "+f"(r[7][1]), "+f"(r[7][2]), "+f"(r[7][3]),
-                  "+f"(r[8][0]), "+f"(r[8][1]), "+f"(r[8][2]), "+f"(r[8][3]),
-                  "+f"(r[9][0]), "+f"(r[9][1]), "+f"(r[9][2]), "+f"(r[9][3])
-                : "l"(desc_a), "l"(desc_b)
-            );
-        }
-
-        __device__ __forceinline__ void mm88(float r[11][4], uint64_t desc_a, uint64_t desc_b) {
-            asm volatile(
-                "{\n"
-                "wgmma.mma_async.sync.aligned.m64n88k16.f32.bf16.bf16 {"
-                    "%0 ,  %1,  %2,  %3, "
-                    "%4 ,  %5,  %6,  %7, "
-                    "%8 ,  %9, %10, %11, "
-                    "%12, %13, %14, %15, "
-                    "%16, %17, %18, %19, "
-                    "%20, %21, %22, %23, "
-                    "%24, %25, %26, %27, "
-                    "%28, %29, %30, %31, "
-                    "%32, %33, %34, %35, "
-                    "%36, %37, %38, %39, "
-                    "%40, %41, %42, %43  "
-                "}, %44, %45, 1, 1, 1, 0, 0;\n"
-                "}\n"
-                : "+f"(r[0][0]), "+f"(r[0][1]), "+f"(r[0][2]), "+f"(r[0][3]),
-                  "+f"(r[1][0]), "+f"(r[1][1]), "+f"(r[1][2]), "+f"(r[1][3]),
-                  "+f"(r[2][0]), "+f"(r[2][1]), "+f"(r[2][2]), "+f"(r[2][3]),
-                  "+f"(r[3][0]), "+f"(r[3][1]), "+f"(r[3][2]), "+f"(r[3][3]),
-                  "+f"(r[4][0]), "+f"(r[4][1]), "+f"(r[4][2]), "+f"(r[4][3]),
-                  "+f"(r[5][0]), "+f"(r[5][1]), "+f"(r[5][2]), "+f"(r[5][3]),
-                  "+f"(r[6][0]), "+f"(r[6][1]), "+f"(r[6][2]), "+f"(r[6][3]),
-                  "+f"(r[7][0]), "+f"(r[7][1]), "+f"(r[7][2]), "+f"(r[7][3]),
-                  "+f"(r[8][0]), "+f"(r[8][1]), "+f"(r[8][2]), "+f"(r[8][3]),
-                  "+f"(r[9][0]), "+f"(r[9][1]), "+f"(r[9][2]), "+f"(r[9][3]),
-                  "+f"(r[10][0]), "+f"(r[10][1]), "+f"(r[10][2]), "+f"(r[10][3])
-                : "l"(desc_a), "l"(desc_b)
-            );
-        }
-
-        __device__ __forceinline__ void mm96(float r[12][4], uint64_t desc_a, uint64_t desc_b) {
-            asm volatile(
-                "{\n"
-                "wgmma.mma_async.sync.aligned.m64n96k16.f32.bf16.bf16 {"
-                    "%0 ,  %1,  %2,  %3,  %4,  %5,  %6,  %7, "
-                    "%8 ,  %9, %10, %11, %12, %13, %14, %15, "
-                    "%16, %17, %18, %19, %20, %21, %22, %23, "
-                    "%24, %25, %26, %27, %28, %29, %30, %31, "
-                    "%32, %33, %34, %35, %36, %37, %38, %39, "
-                    "%40, %41, %42, %43, %44, %45, %46, %47  "
-                "}, %48, %49, 1, 1, 1, 0, 0;\n"
-                "}\n"
-                : "+f"(r[0][0]),  "+f"(r[0][1]),  "+f"(r[0][2]),  "+f"(r[0][3]),
-                  "+f"(r[1][0]),  "+f"(r[1][1]),  "+f"(r[1][2]),  "+f"(r[1][3]),
-                  "+f"(r[2][0]),  "+f"(r[2][1]),  "+f"(r[2][2]),  "+f"(r[2][3]),
-                  "+f"(r[3][0]),  "+f"(r[3][1]),  "+f"(r[3][2]),  "+f"(r[3][3]),
-                  "+f"(r[4][0]),  "+f"(r[4][1]),  "+f"(r[4][2]),  "+f"(r[4][3]),
-                  "+f"(r[5][0]),  "+f"(r[5][1]),  "+f"(r[5][2]),  "+f"(r[5][3]),
-                  "+f"(r[6][0]),  "+f"(r[6][1]),  "+f"(r[6][2]),  "+f"(r[6][3]),
-                  "+f"(r[7][0]),  "+f"(r[7][1]),  "+f"(r[7][2]),  "+f"(r[7][3]),
-                  "+f"(r[8][0]),  "+f"(r[8][1]),  "+f"(r[8][2]),  "+f"(r[8][3]),
-                  "+f"(r[9][0]),  "+f"(r[9][1]),  "+f"(r[9][2]),  "+f"(r[9][3]),
-                  "+f"(r[10][0]), "+f"(r[10][1]), "+f"(r[10][2]), "+f"(r[10][3]),
-                  "+f"(r[11][0]), "+f"(r[11][1]), "+f"(r[11][2]), "+f"(r[11][3])
-                : "l"(desc_a), "l"(desc_b)
-            );
-        }
-
-        __device__ __forceinline__ void mm104(float r[13][4], uint64_t desc_a, uint64_t desc_b) {
-            asm volatile(
-                "{\n"
-                "wgmma.mma_async.sync.aligned.m64n104k16.f32.bf16.bf16 {"
-                    "%0 ,  %1,  %2,  %3,  %4,  %5,  %6,  %7, "
-                    "%8 ,  %9, %10, %11, %12, %13, %14, %15, "
-                    "%16, %17, %18, %19, %20, %21, %22, %23, "
-                    "%24, %25, %26, %27, %28, %29, %30, %31, "
-                    "%32, %33, %34, %35, %36, %37, %38, %39, "
-                    "%40, %41, %42, %43, %44, %45, %46, %47,  "
-                    "%48, %49, %50, %51 "
-                "}, %52, %53, 1, 1, 1, 0, 0;\n"
-                "}\n"
-                : "+f"(r[0][0]),  "+f"(r[0][1]),  "+f"(r[0][2]),  "+f"(r[0][3]),
-                  "+f"(r[1][0]),  "+f"(r[1][1]),  "+f"(r[1][2]),  "+f"(r[1][3]),
-                  "+f"(r[2][0]),  "+f"(r[2][1]),  "+f"(r[2][2]),  "+f"(r[2][3]),
-                  "+f"(r[3][0]),  "+f"(r[3][1]),  "+f"(r[3][2]),  "+f"(r[3][3]),
-                  "+f"(r[4][0]),  "+f"(r[4][1]),  "+f"(r[4][2]),  "+f"(r[4][3]),
-                  "+f"(r[5][0]),  "+f"(r[5][1]),  "+f"(r[5][2]),  "+f"(r[5][3]),
-                  "+f"(r[6][0]),  "+f"(r[6][1]),  "+f"(r[6][2]),  "+f"(r[6][3]),
-                  "+f"(r[7][0]),  "+f"(r[7][1]),  "+f"(r[7][2]),  "+f"(r[7][3]),
-                  "+f"(r[8][0]),  "+f"(r[8][1]),  "+f"(r[8][2]),  "+f"(r[8][3]),
-                  "+f"(r[9][0]),  "+f"(r[9][1]),  "+f"(r[9][2]),  "+f"(r[9][3]),
-                  "+f"(r[10][0]), "+f"(r[10][1]), "+f"(r[10][2]), "+f"(r[10][3]),
-                  "+f"(r[11][0]), "+f"(r[11][1]), "+f"(r[11][2]), "+f"(r[11][3]),
-                  "+f"(r[12][0]), "+f"(r[12][1]), "+f"(r[12][2]), "+f"(r[12][3])
-                : "l"(desc_a), "l"(desc_b)
-            );
-        }
-
-        __device__ __forceinline__ void mm112(float r[14][4], uint64_t desc_a, uint64_t desc_b) {
-            asm volatile(
-                "{\n"
-                "wgmma.mma_async.sync.aligned.m64n112k16.f32.bf16.bf16 {"
-                    "%0 ,  %1,  %2,  %3,  %4,  %5,  %6,  %7, "
-                    "%8 ,  %9, %10, %11, %12, %13, %14, %15, "
-                    "%16, %17, %18, %19, %20, %21, %22, %23, "
-                    "%24, %25, %26, %27, %28, %29, %30, %31, "
-                    "%32, %33, %34, %35, %36, %37, %38, %39, "
-                    "%40, %41, %42, %43, %44, %45, %46, %47, "
-                    "%48, %49, %50, %51, %52, %53, %54, %55  "
-                "}, %56, %57, 1, 1, 1, 0, 0;\n"
-                "}\n"
-                : "+f"(r[0][0]),  "+f"(r[0][1]),  "+f"(r[0][2]),  "+f"(r[0][3]),
-                  "+f"(r[1][0]),  "+f"(r[1][1]),  "+f"(r[1][2]),  "+f"(r[1][3]),
-                  "+f"(r[2][0]),  "+f"(r[2][1]),  "+f"(r[2][2]),  "+f"(r[2][3]),
-                  "+f"(r[3][0]),  "+f"(r[3][1]),  "+f"(r[3][2]),  "+f"(r[3][3]),
-                  "+f"(r[4][0]),  "+f"(r[4][1]),  "+f"(r[4][2]),  "+f"(r[4][3]),
-                  "+f"(r[5][0]),  "+f"(r[5][1]),  "+f"(r[5][2]),  "+f"(r[5][3]),
-                  "+f"(r[6][0]),  "+f"(r[6][1]),  "+f"(r[6][2]),  "+f"(r[6][3]),
-                  "+f"(r[7][0]),  "+f"(r[7][1]),  "+f"(r[7][2]),  "+f"(r[7][3]),
-                  "+f"(r[8][0]),  "+f"(r[8][1]),  "+f"(r[8][2]),  "+f"(r[8][3]),
-                  "+f"(r[9][0]),  "+f"(r[9][1]),  "+f"(r[9][2]),  "+f"(r[9][3]),
-                  "+f"(r[10][0]), "+f"(r[10][1]), "+f"(r[10][2]), "+f"(r[10][3]),
-                  "+f"(r[11][0]), "+f"(r[11][1]), "+f"(r[11][2]), "+f"(r[11][3]),
-                  "+f"(r[12][0]), "+f"(r[12][1]), "+f"(r[12][2]), "+f"(r[12][3]),
-                  "+f"(r[13][0]), "+f"(r[13][1]), "+f"(r[13][2]), "+f"(r[13][3])
-                : "l"(desc_a), "l"(desc_b)
-            );
-        }
-
-        __device__ __forceinline__ void mm120(float r[15][4], uint64_t desc_a, uint64_t desc_b) {
-            asm volatile(
-                "{\n"
-                "wgmma.mma_async.sync.aligned.m64n120k16.f32.bf16.bf16 {"
-                    "%0 ,  %1,  %2,  %3,  %4,  %5,  %6,  %7, "
-                    "%8 ,  %9, %10, %11, %12, %13, %14, %15, "
-                    "%16, %17, %18, %19, %20, %21, %22, %23, "
-                    "%24, %25, %26, %27, %28, %29, %30, %31, "
-                    "%32, %33, %34, %35, %36, %37, %38, %39, "
-                    "%40, %41, %42, %43, %44, %45, %46, %47, "
-                    "%48, %49, %50, %51, %52, %53, %54, %55,  "
-                    "%56, %57, %58, %59 "
-                "}, %60, %61, 1, 1, 1, 0, 0;\n"
-                "}\n"
-                : "+f"(r[0][0]),  "+f"(r[0][1]),  "+f"(r[0][2]),  "+f"(r[0][3]),
-                  "+f"(r[1][0]),  "+f"(r[1][1]),  "+f"(r[1][2]),  "+f"(r[1][3]),
-                  "+f"(r[2][0]),  "+f"(r[2][1]),  "+f"(r[2][2]),  "+f"(r[2][3]),
-                  "+f"(r[3][0]),  "+f"(r[3][1]),  "+f"(r[3][2]),  "+f"(r[3][3]),
-                  "+f"(r[4][0]),  "+f"(r[4][1]),  "+f"(r[4][2]),  "+f"(r[4][3]),
-                  "+f"(r[5][0]),  "+f"(r[5][1]),  "+f"(r[5][2]),  "+f"(r[5][3]),
-                  "+f"(r[6][0]),  "+f"(r[6][1]),  "+f"(r[6][2]),  "+f"(r[6][3]),
-                  "+f"(r[7][0]),  "+f"(r[7][1]),  "+f"(r[7][2]),  "+f"(r[7][3]),
-                  "+f"(r[8][0]),  "+f"(r[8][1]),  "+f"(r[8][2]),  "+f"(r[8][3]),
-                  "+f"(r[9][0]),  "+f"(r[9][1]),  "+f"(r[9][2]),  "+f"(r[9][3]),
-                  "+f"(r[10][0]), "+f"(r[10][1]), "+f"(r[10][2]), "+f"(r[10][3]),
-                  "+f"(r[11][0]), "+f"(r[11][1]), "+f"(r[11][2]), "+f"(r[11][3]),
-                  "+f"(r[12][0]), "+f"(r[12][1]), "+f"(r[12][2]), "+f"(r[12][3]),
-                  "+f"(r[13][0]), "+f"(r[13][1]), "+f"(r[13][2]), "+f"(r[13][3]),
-                  "+f"(r[14][0]), "+f"(r[14][1]), "+f"(r[14][2]), "+f"(r[14][3])
-                : "l"(desc_a), "l"(desc_b)
-            );
-        }
-
-        __device__ __forceinline__ void mm128(float r[16][4], uint64_t desc_a, uint64_t desc_b) {
-            asm volatile(
-                "{\n"
-                "wgmma.mma_async.sync.aligned.m64n128k16.f32.bf16.bf16 {"
-                    "%0 ,  %1,  %2,  %3,  %4,  %5,  %6,  %7, "
-                    "%8 ,  %9, %10, %11, %12, %13, %14, %15, "
-                    "%16, %17, %18, %19, %20, %21, %22, %23, "
-                    "%24, %25, %26, %27, %28, %29, %30, %31, "
-                    "%32, %33, %34, %35, %36, %37, %38, %39, "
-                    "%40, %41, %42, %43, %44, %45, %46, %47, "
-                    "%48, %49, %50, %51, %52, %53, %54, %55, "
-                    "%56, %57, %58, %59, %60, %61, %62, %63  "
-                "}, %64, %65, 1, 1, 1, 0, 0;\n"
-                "}\n"
-                : "+f"(r[0][0]),  "+f"(r[0][1]),  "+f"(r[0][2]),  "+f"(r[0][3]),
-                  "+f"(r[1][0]),  "+f"(r[1][1]),  "+f"(r[1][2]),  "+f"(r[1][3]),
-                  "+f"(r[2][0]),  "+f"(r[2][1]),  "+f"(r[2][2]),  "+f"(r[2][3]),
-                  "+f"(r[3][0]),  "+f"(r[3][1]),  "+f"(r[3][2]),  "+f"(r[3][3]),
-                  "+f"(r[4][0]),  "+f"(r[4][1]),  "+f"(r[4][2]),  "+f"(r[4][3]),
-                  "+f"(r[5][0]),  "+f"(r[5][1]),  "+f"(r[5][2]),  "+f"(r[5][3]),
-                  "+f"(r[6][0]),  "+f"(r[6][1]),  "+f"(r[6][2]),  "+f"(r[6][3]),
-                  "+f"(r[7][0]),  "+f"(r[7][1]),  "+f"(r[7][2]),  "+f"(r[7][3]),
-                  "+f"(r[8][0]),  "+f"(r[8][1]),  "+f"(r[8][2]),  "+f"(r[8][3]),
-                  "+f"(r[9][0]),  "+f"(r[9][1]),  "+f"(r[9][2]),  "+f"(r[9][3]),
-                  "+f"(r[10][0]), "+f"(r[10][1]), "+f"(r[10][2]), "+f"(r[10][3]),
-                  "+f"(r[11][0]), "+f"(r[11][1]), "+f"(r[11][2]), "+f"(r[11][3]),
-                  "+f"(r[12][0]), "+f"(r[12][1]), "+f"(r[12][2]), "+f"(r[12][3]),
-                  "+f"(r[13][0]), "+f"(r[13][1]), "+f"(r[13][2]), "+f"(r[13][3]),
-                  "+f"(r[14][0]), "+f"(r[14][1]), "+f"(r[14][2]), "+f"(r[14][3]),
-                  "+f"(r[15][0]), "+f"(r[15][1]), "+f"(r[15][2]), "+f"(r[15][3])
-                : "l"(desc_a), "l"(desc_b)
-            );
-        }
-
-        template <const int32_t bm>
-        __device__ __forceinline__ void wgmma(float r[bm>>3][4], uint64_t desc_a, uint64_t desc_b) {
-            static_assert(bm >= 8 && bm <= 128 && !(bm & 7));
-            if constexpr (bm == 8)   mm8  (r, desc_a, desc_b);
-            if constexpr (bm == 16)  mm16 (r, desc_a, desc_b);
-            if constexpr (bm == 24)  mm24 (r, desc_a, desc_b);
-            if constexpr (bm == 32)  mm32 (r, desc_a, desc_b);
-            if constexpr (bm == 40)  mm40 (r, desc_a, desc_b);
-            if constexpr (bm == 48)  mm48 (r, desc_a, desc_b);
-            if constexpr (bm == 56)  mm56 (r, desc_a, desc_b);
-            if constexpr (bm == 64)  mm64 (r, desc_a, desc_b);
-            if constexpr (bm == 72)  mm72 (r, desc_a, desc_b);
-            if constexpr (bm == 80)  mm80 (r, desc_a, desc_b);
-            if constexpr (bm == 88)  mm88 (r, desc_a, desc_b);
-            if constexpr (bm == 96)  mm96 (r, desc_a, desc_b);
-            if constexpr (bm == 104) mm104(r, desc_a, desc_b);
-            if constexpr (bm == 112) mm112(r, desc_a, desc_b);
-            if constexpr (bm == 120) mm120(r, desc_a, desc_b);
-            if constexpr (bm == 128) mm128(r, desc_a, desc_b);
-        }
-    }
-
     namespace reg_alloc {
         template <const uint32_t regs>
         __device__ __forceinline__ void alloc() {
@@ -477,20 +127,6 @@ namespace pi {
         template <const uint32_t regs>
         __device__ __forceinline__ void dealloc() {
             asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" :: "n"(regs));
-        }
-    }
-
-    namespace warp_group {
-        __device__ __forceinline__ void arrive() {
-            asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
-        }
-
-        __device__ __forceinline__ void commit_batch() {
-            asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
-        }
-
-        __device__ __forceinline__ void await() {
-            asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
         }
     }
 
