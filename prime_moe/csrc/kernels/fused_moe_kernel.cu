@@ -51,7 +51,7 @@ namespace pi {
         return r;
     }
 
-    namespace tcgen5 {
+    namespace tcgen05 {
         [[nodiscard]] __device__ __forceinline__ uint64_t desc_enc(int addr) {
             return (static_cast<uint64_t>(addr)&0x3ffff)>>4;
         }
@@ -421,7 +421,7 @@ namespace pi {
                         for (int32_t k=0; k < 4; ++k)
                             asm volatile ("" : "+f"(tile[i][j][k]) :: "memory");
                 cuda::ptx::fence_proxy_async(cuda::ptx::space_shared);
-                warp_group::arrive();
+                tcgen05::after_thread_sync();
                 for (int32_t i=0; i < TN; ++i) {
                     __nv_bfloat16 *sw = smem_up.w + smem_stage*WS + (warp_id>>2)*(BN<<2)*BK + (i<<6)*BK;
                     __nv_bfloat16 *sx = smem_up.x + smem_stage*XS;
@@ -432,8 +432,9 @@ namespace pi {
                     wgmma::wgmma<BM>(tile[i], desc_w+2*(32>>4), desc_x+2*(32>>4));
                     wgmma::wgmma<BM>(tile[i], desc_w+3*(32>>4), desc_x+3*(32>>4));
                 }
-                warp_group::commit_batch();
-                warp_group::await();
+                //warp_group::commit_batch();
+                asm volatile("" ::: "memory");
+                tcgen05::await_ld();
                 barrier::arrive(bar+STAGES+smem_stage);
                 for (int32_t tm=0; tm < TM; ++tm)
                 for (int32_t tn=0; tn < TN; ++tn) {
@@ -476,7 +477,7 @@ namespace pi {
                     for (int32_t j=0; j < TM; ++j)
                         for (int32_t k=0; k < 4; ++k)
                             asm volatile ("" : "+f"(tile[i][j][k]) :: "memory");
-                warp_group::arrive();
+                tcgen05::after_thread_sync();
                 for (int32_t tn2=0; tn2 < TN2; ++tn2) {
                     __nv_bfloat16 *sw = smem_down.w + smem_stage*WS + (((warp_id>>2)*TN2 + tn2)<<6)*BK2;
                     uint64_t desc_w = smem_desc_encode<BK2/2, 1, SWIZZLE_MODE_DOWN>(sw);
@@ -488,8 +489,9 @@ namespace pi {
                         desc_x += 32>>4;
                     }
                 }
-                warp_group::commit_batch();
-                warp_group::await();
+                //warp_group::commit_batch();
+                asm volatile("" ::: "memory");
+                tcgen05::await_ld();
                 barrier::arrive(bar+STAGES+smem_stage);
                 __nv_bfloat16 out_tile[TN2>>1][TM][8];
                 for (int32_t tn2=0; tn2 < TN2; tn2 += 2)
