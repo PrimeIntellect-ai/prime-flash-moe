@@ -22,13 +22,3 @@ dependencies = [
   "torchvision",
   "pytorch-triton",
 ]
-
-[tool.uv.sources]
-torch = { index = "pytorch-nightly-cu130" }
-torchvision = { index = "pytorch-nightly-cu130" }
-pytorch-triton = { index = "pytorch-nightly-cu130" }
-
-[[tool.uv.index]]
-name = "pytorch-nightly-cu130"
-url = "https://download.pytorch.org/whl/nightly/cu130"
-#explicit = true
