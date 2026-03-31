@@ -7,10 +7,6 @@
 #include <cudaTypedefs.h>
 #include <cuda_runtime.h>
 
-#ifndef PRIME_MOE_ENABLE_TCGEN05
-#define PRIME_MOE_ENABLE_TCGEN05 1
-#endif
-
 namespace pi {
     [[nodiscard]] static PFN_cuTensorMapEncodeTiled_v12000 getProcAddress_cuTensorMapEncodeTiled() {
         static PFN_cuTensorMapEncodeTiled_v12000 fn = nullptr;
@@ -38,18 +34,6 @@ namespace pi {
     template <const uint64_t sdo, const uint64_t ldo, uint64_t mode>
     [[nodiscard]] __device__ __forceinline__ uint64_t smem_desc_encode(void *p) {
         return ((static_cast<uint64_t>(__cvta_generic_to_shared(p)) & 0x3ffff)>>4) | (ldo<<16) | (sdo<<32) | (mode<<62);
-    }
-
-    [[nodiscard]] static __device__ __forceinline__ uint32_t lane_id() {
-        uint32_t r;
-        asm volatile("mov.u32 %0, %laneid;\n" : "=r"(r));
-        return r;
-    }
-
-    [[nodiscard]] static __device__ __forceinline__ uint32_t warp_id() {
-        uint32_t r;
-        asm volatile("mov.u32 %0, %warpid;\n" : "=r"(r));
-        return r;
     }
 
     namespace tcgen05 {
@@ -533,6 +517,7 @@ namespace pi {
 
     template <const size_t rank>
     [[nodiscard]] static CUtensorMap init_tmap(
+        const char *name,
         const void *ptr,
         const std::array<uint64_t, rank> &shape,
         const std::array<uint64_t, rank> &strides,
@@ -541,7 +526,8 @@ namespace pi {
         CUtensorMapSwizzle swizzle
     ) {
         CUtensorMap map = {};
-        auto res = cuTensorMapEncodeTiled(
+        auto *encode_fn =  getProcAddress_cuTensorMapEncodeTiled();
+        CUresult res = (*encode_fn)(
             &map,
             CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
             rank,
@@ -555,8 +541,13 @@ namespace pi {
             CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
             CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
         );
-        if (res != CUDA_SUCCESS)
-            throw std::runtime_error {"Failed to encode tensor map: " + std::to_string(res)};
+        if (res != CUDA_SUCCESS) {
+            /*const char *error_name = nullptr;
+            cuGetErrorName(res, &error_name);
+            error_name = error_name && *error_name ? error_name : "Unknown error";
+            throw std::runtime_error {"Failed to encode tensor map: " + std::string{error_name}};*/
+            throw std::runtime_error {"Failed to encode tensor map: " + std::string{name} + ": " + std::to_string(res)};
+        }
         return map;
     }
 
@@ -593,6 +584,7 @@ namespace pi {
             throw std::runtime_error {"Failed to set max dynamic shared memory size for fused_moe_kernel: " + std::to_string(SMEM) + " bytes"};
         auto* cuTensorMapEncodeTiled = getProcAddress_cuTensorMapEncodeTiled();
         CUtensorMap map_w = init_tmap<2>(
+            "w",
             w,
             {static_cast<uint64_t>(K), static_cast<uint64_t>(N*num_experts)},
             {K*sizeof(__nv_bfloat16)},
@@ -601,6 +593,7 @@ namespace pi {
             CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B
         );
         CUtensorMap map_w2 = init_tmap<2>(
+            "w2",
             w2,
             {static_cast<uint64_t>(N>>1), static_cast<uint64_t>(K*num_experts)},
             {(N>>1)*sizeof(__nv_bfloat16)},
