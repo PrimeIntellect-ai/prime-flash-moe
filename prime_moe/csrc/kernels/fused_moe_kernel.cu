@@ -396,9 +396,12 @@ namespace pi {
             }
         };
         const auto consumer = [&] {
-            int32_t tok_src = M;
-            if (threadIdx.x < PRODUCER_THREADS+BM)
-                tok_src = sorted_token_ids[warp_m*BM + threadIdx.x-PRODUCER_THREADS]/top_k;
+            int32_t tok_src = -1;
+            if (threadIdx.x >= PRODUCER_THREADS && threadIdx.x < PRODUCER_THREADS + BM) {
+                int32_t tdest = sorted_token_ids[warp_m*BM + (threadIdx.x - PRODUCER_THREADS)];
+                if (tdest >= 0)
+                    tok_src = tdest / top_k;
+            }
             for (int32_t i=0; i < STAGES; ++i) barrier::arrive(bar+STAGES+i);
             int32_t smem_stage = 0;
             for (int32_t stage=0; stage < n_stages_up; ++stage) {
@@ -515,7 +518,7 @@ namespace pi {
                 cuda::ptx::fence_proxy_async(cuda::ptx::space_shared);
                 con_sync();
                 if (threadIdx.x < PRODUCER_THREADS+BM) {
-                    if (tok_src < M) {
+                    if (tok_src >= 0 && tok_src < M) {
                         cuda::ptx::cp_reduce_async_bulk(
                             cuda::ptx::space_global,
                             cuda::ptx::space_shared,
