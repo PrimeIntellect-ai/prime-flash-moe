@@ -22,10 +22,10 @@ def moe_naive(x: torch.Tensor, wgT: torch.Tensor, wuT: torch.Tensor, wdT: torch.
         out_dtype=torch.bfloat16,
     )
 
-N, D = 2048, 2048
-H = 4096
-M = 3072
-E = 16
+N, D = 2048>>4, 2048>>4
+H = 4096>>4
+M = 3072>>4
+E = 16>>4
 
 import torch
 
@@ -145,9 +145,11 @@ def test_cfg(num_tokens, K, E, N, top_k, block_m, bn, wn, stages):
     topk_ids = torch.hstack((topk_ids, torch.ones(num_tokens, device='cuda:0').view(num_tokens,1).to(torch.int32)*(E-1)))
     topk_weights = torch.nn.functional.softmax(torch.randn((num_tokens, top_k), dtype=torch.float32, device='cuda:0'), dim=-1)
     out = torch.zeros_like(x, dtype=torch.bfloat16, device='cuda:0')
-    block_size_m = pick_block_size_m(num_tokens)
     sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size_simple(
-        topk_ids, block_size_m, E
+        # IMPORTANT: The CUDA kernel interprets `block_m` as the token-blocking
+        # used to create `expert_ids` (one expert id per block). For correctness
+        # we must align using the same `block_m` we pass into the kernel.
+        topk_ids, block_m, E
     )
     torch.ops.prime_moe.fused_moe_bf16(
         x,

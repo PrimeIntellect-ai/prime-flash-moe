@@ -5,9 +5,10 @@
 #include <cuda/ptx>
 #include <cuda.h>
 #include <cudaTypedefs.h>
+#include <cuda_runtime.h>
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1000
-#error "Requires Blackwell SM100a (tcgen05)"
+#ifndef PRIME_MOE_ENABLE_TCGEN05
+#define PRIME_MOE_ENABLE_TCGEN05 1
 #endif
 
 namespace pi {
@@ -56,6 +57,7 @@ namespace pi {
             return (static_cast<uint64_t>(addr)&0x3ffff)>>4;
         }
 
+        /*
         __device__ __forceinline__ void mma_f16(int addr, uint64_t desc_a, uint64_t desc_b, uint64_t desc_i, int enable_input_d) {
             asm volatile(
                 "{\n"
@@ -67,7 +69,7 @@ namespace pi {
                 : "r"(addr), "l"(desc_a), "l"(desc_b), "r"(desc_i), "r"(enable_input_d)
                 : "memory"
             );
-        }
+        }*/
 
         __device__ __forceinline__ void commit_mbarrier(uint64_t *mbar) {
             asm volatile(
@@ -425,12 +427,12 @@ namespace pi {
                 for (int32_t i=0; i < TN; ++i) {
                     __nv_bfloat16 *sw = smem_up.w + smem_stage*WS + (warp_id>>2)*(BN<<2)*BK + (i<<6)*BK;
                     __nv_bfloat16 *sx = smem_up.x + smem_stage*XS;
-                    uint64_t desc_w = smem_desc_encode<64, 1, SWIZZLE_MODE_UP>(sw);
+                    /*uint64_t desc_w = smem_desc_encode<64, 1, SWIZZLE_MODE_UP>(sw);
                     uint64_t desc_x = smem_desc_encode<64, 1, SWIZZLE_MODE_UP>(sx);
                     wgmma::wgmma<BM>(tile[i], desc_w, desc_x);
                     wgmma::wgmma<BM>(tile[i], desc_w+1*(32>>4), desc_x+1*(32>>4));
                     wgmma::wgmma<BM>(tile[i], desc_w+2*(32>>4), desc_x+2*(32>>4));
-                    wgmma::wgmma<BM>(tile[i], desc_w+3*(32>>4), desc_x+3*(32>>4));
+                    wgmma::wgmma<BM>(tile[i], desc_w+3*(32>>4), desc_x+3*(32>>4));*/
                 }
                 //warp_group::commit_batch();
                 asm volatile("" ::: "memory");
@@ -484,9 +486,9 @@ namespace pi {
                     uint64_t desc_x = smem_desc_encode<BK2/2, 1, SWIZZLE_MODE_DOWN>(sx);
                     #pragma unroll
                     for (int32_t tk=0; tk < BK2>>5; ++tk) {
-                        wgmma::wgmma<BM>(tile[tn2], desc_w, desc_x);
-                        desc_w += 32>>4;
-                        desc_x += 32>>4;
+                        //wgmma::wgmma<BM>(tile[tn2], desc_w, desc_x);
+                        //desc_w += 32>>4;
+                        //desc_x += 32>>4;
                     }
                 }
                 //warp_group::commit_batch();
@@ -702,8 +704,12 @@ namespace pi {
         int32_t stages,
         cudaStream_t stream
     ) {
-       switch (block_m) {
-            case 8: dispatch_bn_wn<8>(block_n, warp_n, stages, x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream); break;
-       }
+        switch (block_m) {
+            case 8:
+                dispatch_bn_wn<8>(block_n, warp_n, stages, x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream);
+                break;
+            default:
+                throw std::runtime_error {"Unsupported block_m for tcgen05 path: " + std::to_string(block_m)};
+        }
     }
 }
