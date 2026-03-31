@@ -22,10 +22,10 @@ def moe_naive(x: torch.Tensor, wgT: torch.Tensor, wuT: torch.Tensor, wdT: torch.
         out_dtype=torch.bfloat16,
     )
 
-N, D = 2048>>4, 2048>>4
-H = 4096>>4
-M = 3072>>4
-E = 16>>4
+N, D = 2048, 2048
+H = 4096
+M = 3072
+E = 16
 
 import torch
 

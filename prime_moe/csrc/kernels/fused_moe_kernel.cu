@@ -367,8 +367,8 @@ namespace pi {
                 for (int32_t r=0; r < X_IT; ++r) {
                     int32_t row = tsrc[r];
                     if (row >= 0 && row < M && i < XS) {
-                        uint32_t sm = __cvta_generic_to_shared(smem_up.x + smem_stage * XS + swi);
-                        cp_async::cg256<TB>(sm, reinterpret_cast<const uint4 *>(x + row * K + col));
+                        uint32_t sm = __cvta_generic_to_shared(smem_up.x + smem_stage*XS + swi);
+                        cp_async::cg256<TB>(sm, reinterpret_cast<const uint4 *>(x + row*K + col));
                     }
                     i += PRODUCER_THREADS*TO;
                     swi += PRODUCER_THREADS*TO;
@@ -413,6 +413,12 @@ namespace pi {
                     for (int32_t j=0; j < TM; ++j)
                         for (int32_t k=0; k < 4; ++k)
                             asm volatile ("" : "+f"(tile[i][j][k]) :: "memory");
+                // debug vals
+                #pragma unroll
+                for (int32_t i=0; i < TN; ++i)
+                    for (int32_t j=0; j < TM; ++j)
+                        for (int32_t k=0; k < 4; ++k)
+                            tile[i][j][k] = 2.5f;
                 cuda::ptx::fence_proxy_async(cuda::ptx::space_shared);
                 tcgen05::after_thread_sync();
                 for (int32_t i=0; i < TN; ++i) {
@@ -470,6 +476,12 @@ namespace pi {
                     for (int32_t j=0; j < TM; ++j)
                         for (int32_t k=0; k < 4; ++k)
                             asm volatile ("" : "+f"(tile[i][j][k]) :: "memory");
+                // debug vals
+                #pragma unroll
+                for (int32_t i=0; i < TN2; ++i)
+                    for (int32_t j=0; j < TM; ++j)
+                        for (int32_t k=0; k < 4; ++k)
+                            tile[i][j][k] = 2.5f;
                 tcgen05::after_thread_sync();
                 for (int32_t tn2=0; tn2 < TN2; ++tn2) {
                     __nv_bfloat16 *sw = smem_down.w + smem_stage*WS + (((warp_id>>2)*TN2 + tn2)<<6)*BK2;
