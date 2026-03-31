@@ -590,7 +590,7 @@ namespace pi {
             {K*sizeof(__nv_bfloat16)},
             {BK, BN*WN},
             {1, 1},
-            CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B
+            CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE
         );
         CUtensorMap map_w2 = init_tmap<2>(
             "w2",
@@ -599,7 +599,7 @@ namespace pi {
             {(N>>1)*sizeof(__nv_bfloat16)},
             {(WN*BN)>>1, BK<<1},
             {1, 1},
-            WN*BN == 256 ? CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B : WN*BN == 128 ? CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_64B : CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_32B
+            CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE
         );
         fused_moe_kernel<BM, BK, BN, WN, STAGES, PRODUCER_THREADS><<<grid, block, SMEM, stream>>>(
             x,
