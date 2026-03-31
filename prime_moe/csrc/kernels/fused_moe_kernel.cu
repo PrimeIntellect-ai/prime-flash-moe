@@ -334,17 +334,24 @@ namespace pi {
         int32_t phase = 0;
         const auto producer = [&] {
             int32_t tsrc[X_IT];
-            int32_t i = threadIdx.x*TO;
-            for (int32_t r=0; r < X_IT; ++r) {
-                if (i < XS) {
-                    int32_t tdest = sorted_token_ids[warp_m*BM + r*(PRODUCER_THREADS>>3) + (threadIdx.x>>3)];
-                    tsrc[r] = tdest/top_k;
-                    if (!(threadIdx.x&7) && tsrc[r] < M && i < XS) {
-                        uint32_t ptr = __cvta_generic_to_shared((topk_scales+((r*(PRODUCER_THREADS>>3))+(threadIdx.x>>3))));
-                        cp_async::cg64<4>(ptr, topk_weights+tdest);
-                    }
+            int32_t i = threadIdx.x * TO;
+            #pragma unroll
+            for (int32_t r = 0; r < X_IT; ++r) {
+                const int32_t row_in_block = r * (PRODUCER_THREADS >> 3) + (threadIdx.x >> 3);
+                const bool row_valid = row_in_block < BM;
+                int32_t tdest = -1;
+                int32_t tok = -1;
+                if (i < XS && row_valid) {
+                    tdest = sorted_token_ids[warp_m * BM + row_in_block];
+                    if (tdest >= 0)
+                        tok = tdest / top_k;
                 }
-                i += PRODUCER_THREADS*TO;
+                tsrc[r] = tok;
+                if (!(threadIdx.x & 7) && i < XS && row_valid && tdest >= 0 && tok < M) {
+                    uint32_t ptr = __cvta_generic_to_shared(topk_scales + row_in_block);
+                    cp_async::cg64<4>(ptr, topk_weights + tdest);
+                }
+                i += PRODUCER_THREADS * TO;
             }
             int32_t smem_stage = 0;
             for (int32_t stage=0; stage < n_stages_up; ++stage) {
@@ -359,9 +366,9 @@ namespace pi {
                 barrier::await(bar+STAGES+smem_stage, phase);
                 for (int32_t r=0; r < X_IT; ++r) {
                     int32_t row = tsrc[r];
-                    if (row < M && i < XS) {
-                        uint32_t sm = __cvta_generic_to_shared(smem_up.x + smem_stage*XS + swi);
-                        cp_async::cg256<TB>(sm, reinterpret_cast<const uint4 *>(x + row*K + col));
+                    if (row >= 0 && row < M && i < XS) {
+                        uint32_t sm = __cvta_generic_to_shared(smem_up.x + smem_stage * XS + swi);
+                        cp_async::cg256<TB>(sm, reinterpret_cast<const uint4 *>(x + row * K + col));
                     }
                     i += PRODUCER_THREADS*TO;
                     swi += PRODUCER_THREADS*TO;
@@ -699,9 +706,11 @@ namespace pi {
         cudaStream_t stream
     ) {
         switch (block_m) {
-            case 8:
-                dispatch_bn_wn<8>(block_n, warp_n, stages, x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream);
-                break;
+            case 8: dispatch_bn_wn<8>(block_n, warp_n, stages, x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream); break;
+            case 16: dispatch_bn_wn<16>(block_n, warp_n, stages, x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream); break;
+            case 32: dispatch_bn_wn<32>(block_n, warp_n, stages, x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream); break;
+            case 64: dispatch_bn_wn<64>(block_n, warp_n, stages, x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream); break;
+            case 128: dispatch_bn_wn<128>(block_n, warp_n, stages, x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream); break;
             default:
                 throw std::runtime_error {"Unsupported block_m for tcgen05 path: " + std::to_string(block_m)};
         }

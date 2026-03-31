@@ -42,14 +42,12 @@ def moe_align_block_size_simple(topk_ids: torch.Tensor, block_size_m: int, num_e
     T, top_k = topk_ids.shape
 
     # Flatten into token/expert pairs
-    token_ids = torch.arange(T, device=device, dtype=torch.int32)
-    token_ids = token_ids[:, None].expand(T, top_k).reshape(-1)      # [T*top_k]
-    expert_flat = topk_ids.reshape(-1).to(torch.int32)               # [T*top_k]
+    pair_ids = torch.arange(T * top_k, device=device, dtype=torch.int32)
+    expert_flat = topk_ids.reshape(-1).to(torch.int32)
 
-    # Sort by expert so tokens are grouped per expert
-    sort_idx = torch.argsort(expert_flat)                            # [T*top_k]
+    sort_idx = torch.argsort(expert_flat)
     expert_sorted = expert_flat[sort_idx]
-    token_sorted  = token_ids[sort_idx]
+    pair_sorted = pair_ids[sort_idx]
 
     # Count how many pairs per expert
     counts = torch.bincount(expert_sorted, minlength=num_experts)    # [E]
@@ -80,7 +78,7 @@ def moe_align_block_size_simple(topk_ids: torch.Tensor, block_size_m: int, num_e
         pc = int(padded_counts[e].item())
 
         if c > 0:
-            sorted_token_ids[write_ptr : write_ptr + c] = token_sorted[read_ptr : read_ptr + c]
+            sorted_token_ids[write_ptr : write_ptr + c] = pair_sorted[read_ptr : read_ptr + c]
         # pad with -1 sentinel (common choice) for empty slots
         if pc > c:
             sorted_token_ids[write_ptr + c : write_ptr + pc] = -1
@@ -126,11 +124,9 @@ top_k = 9
 max_stages = 2
 
 configs = []
-for block_m in range(8, 129, 8):
+for block_m in (1<<i for i in range(3, 8)):
     for bn, wn in [(64, 4), (32, 8)]:
         for stages in range(1, max_stages+1):
-            if stages == 5 and block_m > 100:
-                continue
             configs.append((block_m, bn, wn, stages))
 
 def pick_block_size_m(num_tokens: int):
