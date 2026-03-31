@@ -580,7 +580,8 @@ namespace pi {
             static_cast<uint32_t>(std::ceil(static_cast<double>(sorted_num)/static_cast<double>(block_m))),
             1
         };
-        if (cudaFuncSetAttribute(&fused_moe_kernel<BM, BK, BN, WN, STAGES, PRODUCER_THREADS>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM) != cudaSuccess)
+        auto *kernel = fused_moe_kernel<BM, BK, BN, WN, STAGES, PRODUCER_THREADS>;
+        if (cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM) != cudaSuccess)
             throw std::runtime_error {"Failed to set max dynamic shared memory size for fused_moe_kernel: " + std::to_string(SMEM) + " bytes"};
         auto* cuTensorMapEncodeTiled = getProcAddress_cuTensorMapEncodeTiled();
         CUtensorMap map_w = init_tmap<2>(
@@ -601,7 +602,7 @@ namespace pi {
             {1, 1},
             CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE
         );
-        fused_moe_kernel<BM, BK, BN, WN, STAGES, PRODUCER_THREADS><<<grid, block, SMEM, stream>>>(
+        kernel<<<grid, block, SMEM, stream>>>(
             x,
             map_w,
             map_w2,

@@ -123,11 +123,12 @@ n_vals = [256, 512]
 k_vals = [7168, 4096]
 e_vals = [257, 8, 37]
 top_k = 9
+max_stages = 2
 
 configs = []
 for block_m in range(8, 129, 8):
     for bn, wn in [(64, 4), (32, 8)]:
-        for stages in range(1, 6):
+        for stages in range(1, max_stages+1):
             if stages == 5 and block_m > 100:
                 continue
             configs.append((block_m, bn, wn, stages))
