@@ -427,12 +427,12 @@ namespace pi {
                 for (int32_t i=0; i < TN; ++i) {
                     __nv_bfloat16 *sw = smem_up.w + smem_stage*WS + (warp_id>>2)*(BN<<2)*BK + (i<<6)*BK;
                     __nv_bfloat16 *sx = smem_up.x + smem_stage*XS;
-                    /*uint64_t desc_w = smem_desc_encode<64, 1, SWIZZLE_MODE_UP>(sw);
+                    uint64_t desc_w = smem_desc_encode<64, 1, SWIZZLE_MODE_UP>(sw); /*TODO: fix swizzle mode*/
                     uint64_t desc_x = smem_desc_encode<64, 1, SWIZZLE_MODE_UP>(sx);
                     wgmma::wgmma<BM>(tile[i], desc_w, desc_x);
                     wgmma::wgmma<BM>(tile[i], desc_w+1*(32>>4), desc_x+1*(32>>4));
                     wgmma::wgmma<BM>(tile[i], desc_w+2*(32>>4), desc_x+2*(32>>4));
-                    wgmma::wgmma<BM>(tile[i], desc_w+3*(32>>4), desc_x+3*(32>>4));*/
+                    wgmma::wgmma<BM>(tile[i], desc_w+3*(32>>4), desc_x+3*(32>>4));
                 }
                 //warp_group::commit_batch();
                 asm volatile("" ::: "memory");
@@ -492,9 +492,9 @@ namespace pi {
                     uint64_t desc_x = smem_desc_encode<BK2/2, 1, SWIZZLE_MODE_DOWN>(sx);
                     #pragma unroll
                     for (int32_t tk=0; tk < BK2>>5; ++tk) {
-                        //wgmma::wgmma<BM>(tile[tn2], desc_w, desc_x);
-                        //desc_w += 32>>4;
-                        //desc_x += 32>>4;
+                        wgmma::wgmma<BM>(tile[tn2], desc_w, desc_x); /*TODO: fix swizzle mode*/
+                        desc_w += 32>>4;
+                        desc_x += 32>>4;
                     }
                 }
                 //warp_group::commit_batch();
