@@ -52,7 +52,7 @@ namespace pi {
         TORCH_CHECK((x.size(1)&127) == 0, "K dimension must be a multiple of 128");
         TORCH_CHECK((block_n == 64 && warp_n == 4) || (block_n == 32 && warp_n == 8));
         TORCH_CHECK(stages > 0 && stages < 6);
-        TORCH_CHECK(block_m > 0 && block_m <= 128 && (block_m&7) == 0);
+        TORCH_CHECK(block_m == 128, "Blackwell tcgen05 fused MoE requires block_m=128.");
         TORCH_CHECK(x.is_contiguous());
         TORCH_CHECK(w.is_contiguous());
         TORCH_CHECK(w2.is_contiguous());
