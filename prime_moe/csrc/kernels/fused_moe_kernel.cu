@@ -377,10 +377,8 @@ namespace pi {
                     for (int32_t k16 = 0; k16 < BK / 16; ++k16) {
                         __nv_bfloat16 *a_ptr = smem_up.x + smem_stage*XS + k16*BM*16;
                         __nv_bfloat16 *b_ptr = smem_up.w + smem_stage*WS + k16*TC_N*16;
-
                         uint64_t a_desc = tcgen05::smem_desc_kmajor(a_ptr, BM);
                         uint64_t b_desc = tcgen05::smem_desc_kmajor(b_ptr, TC_N);
-
                         tcgen05::mma_f16(
                             tmem_acc,
                             a_desc,

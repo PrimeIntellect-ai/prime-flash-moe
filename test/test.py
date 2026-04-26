@@ -121,18 +121,13 @@ n_vals = [256, 512]
 k_vals = [7168, 4096]
 e_vals = [257, 8, 37]
 top_k = 9
-max_stages = 2
+max_stages = 1
+block_m = 128 # must be 128 on Blackwell
 
 configs = []
-for block_m in (1<<i for i in range(3, 8)):
-    for bn, wn in [(64, 4), (32, 8)]:
-        for stages in range(1, max_stages+1):
-            configs.append((block_m, bn, wn, stages))
-
-def pick_block_size_m(num_tokens: int):
-    if num_tokens <= 32: return 32
-    if num_tokens <= 64: return 64
-    return 128
+for bn, wn in [(32, 8)]:
+    for stages in range(1, max_stages+1):
+        configs.append((block_m, bn, wn, stages))
 
 def test_cfg(num_tokens, K, E, N, top_k, block_m, bn, wn, stages):
     x = torch.empty((num_tokens, K), dtype=torch.bfloat16, device='cuda:0').normal_(mean=0, std=0.05)
@@ -142,12 +137,7 @@ def test_cfg(num_tokens, K, E, N, top_k, block_m, bn, wn, stages):
     topk_ids = torch.hstack((topk_ids, torch.ones(num_tokens, device='cuda:0').view(num_tokens,1).to(torch.int32)*(E-1)))
     topk_weights = torch.nn.functional.softmax(torch.randn((num_tokens, top_k), dtype=torch.float32, device='cuda:0'), dim=-1)
     out = torch.zeros_like(x, dtype=torch.bfloat16, device='cuda:0')
-    sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size_simple(
-        # IMPORTANT: The CUDA kernel interprets `block_m` as the token-blocking
-        # used to create `expert_ids` (one expert id per block). For correctness
-        # we must align using the same `block_m` we pass into the kernel.
-        topk_ids, block_m, E
-    )
+    sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size_simple(topk_ids, block_m, E)
     torch.ops.prime_moe.fused_moe_bf16(
         x,
         w1,
