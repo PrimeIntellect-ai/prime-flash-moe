@@ -3,6 +3,10 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+moe_bench_latency.png
+moe_bench_speedup.png
+benchmark.png
+
 .idea/
 
 benchmark/benchmark.png
