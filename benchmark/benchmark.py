@@ -16,6 +16,20 @@ def generate_topk_ids(num_experts, num_tokens, top_k, balancedness=1.0):
     return torch.multinomial(probs, num_tokens * top_k, replacement=True).view(num_tokens, top_k)
 
 
+def pack_w1_for_kernel(w1):
+    E, N, K = w1.shape
+    assert N % 256 == 0
+    H = N // 2
+    assert H % 128 == 0
+    gate = w1[:, :H, :]
+    up = w1[:, H:, :]
+    chunks = []
+    for i in range(0, H, 128):
+        chunks.append(gate[:, i : i + 128, :])
+        chunks.append(up[:, i : i + 128, :])
+    return torch.cat(chunks, dim=1).contiguous()
+
+
 def make_routing(topk_ids, block_m, num_experts):
     T, top_k = topk_ids.shape
     pair_ids = torch.arange(T * top_k, device='cuda', dtype=torch.int32)
@@ -138,7 +152,8 @@ def run_one(num_tokens, K, E, N, top_k, block_m, bn, wn, stages, args):
     routing = make_routing(topk_ids, block_m, E)
     out_kernel = torch.empty_like(x)
     native_fn = lambda: moe_native_grouped(x, w1, w2, topk_weights, top_k, routing, weighted=args.weighted)
-    kernel_fn = lambda: moe_kernel(x, w1, w2, topk_weights, out_kernel, top_k, block_m, bn, wn, stages, routing)
+    w1_packed = pack_w1_for_kernel(w1)
+    kernel_fn = lambda: moe_kernel(x, w1_packed, w2, topk_weights, out_kernel, top_k, block_m, bn, wn, stages, routing)
     if args.check:
         ref = native_fn()
         got = kernel_fn()

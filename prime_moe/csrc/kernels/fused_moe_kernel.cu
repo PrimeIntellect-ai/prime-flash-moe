@@ -444,7 +444,8 @@ namespace pi {
                 con_sync();
                 tcgen05::after_thread_sync();
                 if (warp_id < 4) {
-                    const int32_t row = (warp_id<<5)+lane_id;
+                    int32_t row = (warp_id<<5)+lane_id;
+                    float scale = topk_scales[row];
                     #pragma unroll
                     for (int32_t c8=0; c8 < BN2>>3; ++c8) {
                         float vals[8];
@@ -453,7 +454,7 @@ namespace pi {
                         __nv_bfloat16 *dst = smem_down.out+row*PAD+(c8<<3);
                         #pragma unroll
                         for (int32_t e=0; e < 8; ++e) {
-                            dst[e] = __float2bfloat16(vals[e]);
+                            dst[e] = __float2bfloat16(scale*vals[e]);
                         }
                     }
                 }
