@@ -249,10 +249,10 @@ def main():
 
     torch.cuda.set_device('cuda:0')
 
-    batch_sizes = [8, 32, 128, 256, 512, 1024]
+    batch_sizes = [1<<i for i in range(6, 18)]
     n_vals = [256, 512, 1024]
     k_vals = [7168, 4096, 2048]
-    e_vals = [257, 8, 37, 129]
+    e_vals = [128, 256, 512]
 
     top_k = 10
     block_m = 128
@@ -268,7 +268,7 @@ def main():
             rows.append(row)
 
             print(
-                f'  native={row["native_ms"]:.3f} ms '
+                f'native={row["native_ms"]:.3f} ms '
                 f'kernel={row["kernel_ms"]:.3f} ms '
                 f'speedup={row["speedup"]:.2f}x '
                 f'kernel={row["kernel_tflops"]:.1f} TFLOP/s '
