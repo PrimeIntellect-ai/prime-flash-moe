@@ -1,6 +1,7 @@
 import torch
 from . import _C
 
+
 @torch.library.register_fake('prime_moe::fused_moe_bf16')
 def fused_moe_bf16_abstract(
     x: torch.Tensor,
@@ -19,6 +20,7 @@ def fused_moe_bf16_abstract(
 ) -> torch.Tensor:
     return out
 
+
 def fused_moe_bf16(
     x: torch.Tensor,
     w: torch.Tensor,
@@ -34,6 +36,9 @@ def fused_moe_bf16(
     warp_n: int,
     stages: int,
 ) -> torch.Tensor:
-    return torch.ops.prime_moe.fused_moe_bf16(x, w, w2, sorted_token_ids, expert_ids, num_tokens_post_padded, topk_weights, out, top_k, block_m, block_n, warp_n, stages)
+    return torch.ops.prime_moe.fused_moe_bf16(
+        x, w, w2, sorted_token_ids, expert_ids, num_tokens_post_padded, topk_weights, out, top_k, block_m, block_n, warp_n, stages
+    )
+
 
 __all__ = ['fused_moe_bf16']

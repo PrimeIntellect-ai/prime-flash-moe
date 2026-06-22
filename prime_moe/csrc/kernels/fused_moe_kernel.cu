@@ -166,37 +166,37 @@ namespace pi {
         }
     }
 
-    namespace barrier {
-        __device__ __forceinline__ void init(uint64_t *bar, int32_t threads, int32_t transactions) {
+    struct barrier final {
+        __device__ __forceinline__ void init(int32_t threads, int32_t transactions=0) {
             asm volatile(
                 "mbarrier.init.shared::cta.b64 [%0], %1;\n"
-                :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(bar))), "r"(threads+transactions)
+                :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(this))), "r"(threads+transactions)
             );
         }
 
-        __device__ __forceinline__ void arrive_cp_async_mem(uint64_t *bar) {
+        __device__ __forceinline__ void arrive_cp_async_mem() {
             asm volatile(
                 "cp.async.mbarrier.arrive.noinc.shared.b64 [%0];\n"
-                :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(bar)))
+                :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(this)))
             );
         }
 
-        __device__ __forceinline__ void arrive(uint64_t *bar, uint32_t num=1) {
+        __device__ __forceinline__ void arrive(uint32_t num=1) {
             asm volatile(
                 "mbarrier.arrive.shared.b64 _, [%0], %1;\n"
-                :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(bar))), "r"(num)
+                :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(this))), "r"(num)
                 : "memory"
             );
         }
 
-        __device__ __forceinline__ void expect_nb(uint64_t *bar, uint32_t nb) {
+        __device__ __forceinline__ void expect_nb(uint32_t nb) {
             asm volatile(
                 "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;\n"
-                :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(bar))), "r"(nb)
+                :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(this))), "r"(nb)
             );
         }
 
-        __device__ __forceinline__ void await(uint64_t *bar, int32_t phase) {
+        __device__ __forceinline__ void await(int32_t phase) {
             asm volatile(
                 "{\n"
                 ".reg .pred P1;\n"
@@ -204,10 +204,17 @@ namespace pi {
                 "mbarrier.try_wait.parity.shared.b64 P1, [%0], %1;\n"
                 "@!P1 bra.uni AWAIT;\n"
                 "}\n"
-                :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(bar))), "r"(phase)
+                :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(this))), "r"(phase)
             );
         }
-    }
+
+        constexpr __device__ __host__ __forceinline__ uint64_t *operator*() noexcept { return &m_handle; }
+        constexpr __device__ __host__ __forceinline__ const uint64_t *operator*() const noexcept { return &m_handle; }
+      
+    private:
+        uint64_t m_handle;
+    };
+    static_assert(sizeof(barrier) == sizeof(uint64_t) && alignof(barrier) == alignof(uint64_t));
 
     [[nodiscard]] static __device__ __forceinline__ float swiglu(float x, float w) {
         return w*(x/(1.f+__expf(-x)));
@@ -255,9 +262,9 @@ namespace pi {
         static constexpr int32_t TC_N = WN*BN;
 
         extern __shared__ __align__(1024) uint8_t smem_raw[];
-        __shared__ __align__(8) uint64_t bar_copy[STAGES];
-        __shared__ __align__(8) uint64_t bar_recycle[STAGES];
-        __shared__ __align__(8) uint64_t bar_mma[STAGES];
+        __shared__ __align__(8) barrier bar_copy[STAGES];
+        __shared__ __align__(8) barrier bar_recycle[STAGES];
+        __shared__ __align__(8) barrier bar_mma[STAGES];
         __shared__ __align__(4) uint32_t tmem_acc;
         __shared__ float topk_scales[BM];
         __shared__ int32_t row_tok[BM];
@@ -274,9 +281,9 @@ namespace pi {
         warp_id >>= 5;
         if (!threadIdx.x) {
             for (int32_t i = 0; i < STAGES; ++i) {
-                barrier::init(bar_copy+i, PRODUCER_THREADS+1, 0);
-                barrier::init(bar_recycle+i, CONSUMER_THREADS, 0);
-                barrier::init(bar_mma+i, 1, 0);
+                bar_copy[i].init(PRODUCER_THREADS+1);
+                bar_recycle[i].init(CONSUMER_THREADS);
+                bar_mma[i].init(1);
             }
             asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
         }
@@ -295,7 +302,7 @@ namespace pi {
             }
         }
         __syncthreads();
-        auto con_sync = [=]() { asm volatile ("bar.sync 0, %0;\n" :: "n"(CONSUMER_THREADS)); };
+        auto con_sync = [=]() { asm volatile ("bar.sync 1, %0;\n" :: "n"(CONSUMER_THREADS)); };
         int32_t n_stages_up = K / BLOCK_SHAPE_K;
         int32_t n_stages_down = N2 / BN2;
         int32_t phase = 0;
@@ -309,25 +316,25 @@ namespace pi {
                     phase^=1;
                     smem_stage = 0;
                 }
-                const int32_t offs = stage*BK;
-                barrier::await(bar_recycle+smem_stage, phase);
+                int32_t offs = stage*BK;
+                bar_recycle[smem_stage].await(phase);
                 for (int32_t wave=0; wave < BM/ROWS_PER_WAVE; ++wave) {
-                    const int32_t row_in_block = wave*ROWS_PER_WAVE+(threadIdx.x/CHUNKS_PER_ROW);
-                    const int32_t k8 = threadIdx.x&(CHUNKS_PER_ROW-1);
-                    const int32_t tok = row_tok[row_in_block];
+                    int32_t row_in_block = wave*ROWS_PER_WAVE+(threadIdx.x/CHUNKS_PER_ROW);
+                    int32_t k8 = threadIdx.x&(CHUNKS_PER_ROW-1);
+                    int32_t tok = row_tok[row_in_block];
                     if (row_in_block < BM && tok >= 0 && tok < M) {
                         auto *dst = smem_up.x+smem_stage*XS+((k8*BM + row_in_block)<<3);
                         const uint4 *src = reinterpret_cast<const uint4 *>(x+tok*K+offs+(k8<<3));
                         cp_async::cg256<TB>(static_cast<uint32_t>(__cvta_generic_to_shared(dst)), src);
                     }
                 }
-                barrier::arrive_cp_async_mem(bar_copy+smem_stage);
+                bar_copy[smem_stage].arrive_cp_async_mem();
                 if (!threadIdx.x) {
-                    barrier::expect_nb(bar_copy+smem_stage, WS*sizeof(__nv_bfloat16));
+                    bar_copy[smem_stage].expect_nb(WS*sizeof(__nv_bfloat16));
                     cp_async::load3d(
                         smem_up.w+smem_stage*WS,
                         &map_w,
-                        bar_copy+smem_stage,
+                        *bar_copy[smem_stage],
                         0,
                         expert_idx*N+blockIdx.x*(WN*BN),
                         offs>>3
@@ -341,19 +348,19 @@ namespace pi {
                     phase^=1;
                     smem_stage = 0;
                 }
-                barrier::await(bar_recycle+smem_stage, phase);
+                bar_recycle[smem_stage].await(phase);
                 if (!threadIdx.x) {
-                    barrier::expect_nb(bar_copy+smem_stage, WS*sizeof(__nv_bfloat16));
+                    bar_copy[smem_stage].expect_nb(WS*sizeof(__nv_bfloat16));
                     cp_async::load3d(
                         smem_down.w+smem_stage*WS,
                         &map_w2,
-                        bar_copy+smem_stage,
+                        *bar_copy[smem_stage],
                         0,
                         expert_idx*N2+stage*BN2,
                         (blockIdx.x*BK2) / 8
                     );
                 }
-                barrier::arrive_cp_async_mem(bar_copy+smem_stage);
+                bar_copy[smem_stage].arrive_cp_async_mem();
                 ++smem_stage;
             }
         };
@@ -364,7 +371,7 @@ namespace pi {
                 int32_t tdest = sorted_token_ids[warp_m*BM+(threadIdx.x - PRODUCER_THREADS)];
                 if (tdest >= 0) tok_src = tdest / top_k;
             }
-            for (int32_t i=0; i < STAGES; ++i) barrier::arrive(bar_recycle+i);
+            for (int32_t i=0; i < STAGES; ++i) bar_recycle[i].arrive();
             uint32_t idesc = tcgen05::idesc_f32_bf16_bf16(BM, TC_N);
             int32_t smem_stage = 0;
             for (int32_t stage = 0; stage < n_stages_up; ++stage) {
@@ -372,7 +379,7 @@ namespace pi {
                     phase^=1;
                     smem_stage = 0;
                 }
-                barrier::await(bar_copy+smem_stage, phase);
+                bar_copy[smem_stage].await(phase);
                 if (warp_id == 0 && lane_id == 0) {
                     #pragma unroll
                     for (int32_t k16=0; k16 < BK>>4; ++k16) {
@@ -382,10 +389,10 @@ namespace pi {
                         uint64_t b_desc = tcgen05::smem_desc_kmajor(b_ptr, TC_N);
                         tcgen05::mma_f16(tmem_acc, a_desc, b_desc, idesc, stage||k16);
                     }
-                    tcgen05::commit_mbarrier(bar_mma+smem_stage);
+                    tcgen05::commit_mbarrier(*bar_mma[smem_stage]);
                 }
-                barrier::await(bar_mma+smem_stage, phase);
-                barrier::arrive(bar_recycle+smem_stage);
+                bar_mma[smem_stage].await(phase);
+                bar_recycle[smem_stage].arrive();
                 ++smem_stage;
             }
             con_sync();
@@ -394,7 +401,7 @@ namespace pi {
             if (warp_id < 4) {
                 int32_t row = (warp_id<<5)+lane_id;
                 #pragma unroll
-                for (int32_t c8 = 0; c8 < BK2>>3; ++c8) {
+                for (int32_t c8=0; c8 < BK2>>3; ++c8) {
                     float gate[8];
                     float up[8];
                     tcgen05::ld_32x32b_x8(gate, tcgen05::tmem_addr(tmem_acc, row, (c8<<3)));
@@ -412,12 +419,12 @@ namespace pi {
                     phase^=1;
                     smem_stage = 0;
                 }
-                barrier::await(bar_copy+smem_stage, phase);
+                bar_copy[smem_stage].await(phase);
                 if (warp_id == 0 && lane_id == 0) {
                     #pragma unroll
-                    for (int32_t k16 = 0; k16 < BK2 / 16; ++k16) {
-                        __nv_bfloat16 *a_ptr = smem_down.x+k16*BM*16;
-                        __nv_bfloat16 *b_ptr = smem_down.w+smem_stage*WS+k16*BN2*16;
+                    for (int32_t k16=0; k16 < BK2>>4; ++k16) {
+                        __nv_bfloat16 *a_ptr = smem_down.x+((k16*BM)<<4);
+                        __nv_bfloat16 *b_ptr = smem_down.w+smem_stage*WS+((k16*BN2)<<4);
                         uint64_t a_desc = tcgen05::smem_desc_kmajor(a_ptr, BM);
                         uint64_t b_desc = tcgen05::smem_desc_kmajor(b_ptr, BN2);
                         tcgen05::mma_f16(
@@ -428,10 +435,10 @@ namespace pi {
                             k16 != 0
                         );
                     }
-                    tcgen05::commit_mbarrier(bar_mma+smem_stage);
+                    tcgen05::commit_mbarrier(*bar_mma[smem_stage]);
                 }
-                barrier::await(bar_mma+smem_stage, phase);
-                barrier::arrive(bar_recycle+smem_stage);
+                bar_mma[smem_stage].await(phase);
+                bar_recycle[smem_stage].arrive();
                 asm volatile("cp.async.bulk.wait_group 0;\n");
                 cuda::ptx::fence_proxy_async(cuda::ptx::space_shared);
                 con_sync();
