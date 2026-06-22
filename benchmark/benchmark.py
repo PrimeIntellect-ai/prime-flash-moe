@@ -252,7 +252,7 @@ def main():
     batch_sizes = [1<<i for i in range(6, 18)]
     n_vals = [256, 512, 1024]
     k_vals = [7168, 4096, 2048]
-    e_vals = [128, 256, 512]
+    e_vals = [1<<i for i in range(3, 6)]
 
     top_k = 10
     block_m = 128
