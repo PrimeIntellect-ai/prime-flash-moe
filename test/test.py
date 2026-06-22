@@ -139,15 +139,15 @@ for bn, wn in [(32, 8)]:
 
 def pack_w1_for_kernel(w1):
     E, N, K = w1.shape
-    assert N % 256 == 0
-    H = N // 2
-    assert H % 128 == 0
+    assert (N&255) == 0
+    H = N>>1
+    assert (H&127) == 0
     gate = w1[:, :H, :]
     up = w1[:, H:, :]
     chunks = []
     for i in range(0, H, 128):
-        chunks.append(gate[:, i : i + 128, :])
-        chunks.append(up[:, i : i + 128, :])
+        chunks.append(gate[:, i : i+128, :])
+        chunks.append(up[:, i : i+128, :])
     return torch.cat(chunks, dim=1).contiguous()
 
 

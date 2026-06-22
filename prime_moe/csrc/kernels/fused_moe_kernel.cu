@@ -30,13 +30,25 @@ namespace pi {
     }
 
     namespace tcgen05 {
-        [[nodiscard]] __device__ __forceinline__ uint64_t smem_desc_kmajor(const void *ptr, int32_t height) {
-            return ((static_cast<uint64_t>(static_cast<uint32_t>(__cvta_generic_to_shared(ptr)))&0x3ffffu)>>4)
-                 |(((static_cast<uint64_t>(height<<4)&0x3ffffu)>>4)<<16)|(((static_cast<uint64_t>(128)&0x3ffffu)>>4)<<32)
-                 |0x160400000000000ull;
+        [[nodiscard]] __device__ __forceinline__ uint64_t encode_smem_desc(const void *p, int32_t height) {
+            constexpr uint64_t stride_dim = 128;            // stride dim N
+            constexpr uint64_t mat_base_offs = 0;           // mat base offset
+            constexpr uint64_t lead_dim_stride_mod = 0;     // leading dim stride mode, 0=byte offs rel, 1=byte offs abs
+            constexpr uint64_t swizzling_mode = 0;          // swizzle mode, 0=no swizzling, 1=128B with 32B atomic swizzling, 2=128B swizzling, 4=64B swizzling, 6=32B swizzling
+            static_assert(!swizzling_mode || !(swizzling_mode&(swizzling_mode-1))); 
+            auto mat_start_addr = static_cast<uint32_t>(__cvta_generic_to_shared(p));
+            return
+                ((mat_start_addr>>4)&((1ull<<14ull)-1ull))
+                | ((((static_cast<uint64_t>(height & ((1ull<<14ull)-1ull)))))<<16)  // mat desc
+                | ((((stride_dim>>4))&((1ull<<14ull)-1ull))<<32)                    // stride dim byte offset
+                | ((0b1ull&3)<<46)                                                  // fixed const
+                | ((mat_base_offs & 7)<<49)
+                | ((lead_dim_stride_mod & 1)<<52)
+                | (0xb0ull<<53)                                                     // fixed const
+                | ((swizzling_mode & 7)<<61);
         }
 
-        [[nodiscard]] constexpr __device__ __forceinline__ uint32_t idesc_f32_bf16_bf16(int32_t m, int32_t n) {
+        [[nodiscard]] constexpr __device__ __forceinline__ uint32_t encode_idesc_format_1(int32_t m, int32_t n) {
             constexpr uint32_t sparsity_sel = 0; // ignored
             constexpr uint32_t sparsity_mode = 0; // 0=dense,1=sparse
             constexpr uint32_t sat_mode = 0; // 0=no sat, 1=sat
@@ -395,7 +407,7 @@ namespace pi {
                 if (tdest >= 0) tok_src = tdest / top_k;
             }
             for (int32_t i=0; i < STAGES; ++i) bar_recycle[i].arrive();
-            uint32_t idesc = tcgen05::idesc_f32_bf16_bf16(BM, TC_N);
+            uint32_t idesc = tcgen05::encode_idesc_format_1(BM, TC_N);
             int32_t smem_stage = 0;
             for (int32_t stage = 0; stage < n_stages_up; ++stage) {
                 if (smem_stage == STAGES) {
@@ -408,8 +420,8 @@ namespace pi {
                     for (int32_t k16=0; k16 < BK>>4; ++k16) {
                         auto *__restrict__ a_ptr = smem_up.x+smem_stage*XS+((k16*BM)<<4);
                         auto *__restrict__ b_ptr = smem_up.w+smem_stage*WS+((k16*TC_N)<<4);
-                        uint64_t a_desc = tcgen05::smem_desc_kmajor(a_ptr, BM);
-                        uint64_t b_desc = tcgen05::smem_desc_kmajor(b_ptr, TC_N);
+                        uint64_t a_desc = tcgen05::encode_smem_desc(a_ptr, BM);
+                        uint64_t b_desc = tcgen05::encode_smem_desc(b_ptr, TC_N);
                         tcgen05::mma_f16(tmem_acc, a_desc, b_desc, idesc, stage||k16);
                     }
                     tcgen05::commit_mbarrier(*bar_mma[smem_stage]);
@@ -448,8 +460,8 @@ namespace pi {
                     for (int32_t k16=0; k16 < BK2>>4; ++k16) {
                         __nv_bfloat16 *a_ptr = smem_down.x+((k16*BM)<<4);
                         __nv_bfloat16 *b_ptr = smem_down.w+smem_stage*WS+((k16*BN2)<<4);
-                        uint64_t a_desc = tcgen05::smem_desc_kmajor(a_ptr, BM);
-                        uint64_t b_desc = tcgen05::smem_desc_kmajor(b_ptr, BN2);
+                        uint64_t a_desc = tcgen05::encode_smem_desc(a_ptr, BM);
+                        uint64_t b_desc = tcgen05::encode_smem_desc(b_ptr, BN2);
                         tcgen05::mma_f16(
                             tmem_acc,
                             a_desc,
