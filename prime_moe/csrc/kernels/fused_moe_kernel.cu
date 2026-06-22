@@ -591,7 +591,7 @@ namespace pi {
         int32_t block_m,
         cudaStream_t stream
     ) {
-        static constexpr auto BK = 128;
+        static constexpr auto BK = 64;
         static constexpr auto PRODUCER_THREADS = 128;
         static constexpr size_t SMEM = std::max(sizeof(smem_up_pod<STAGES, WN, BM, BK, BN>), sizeof(smem_down_pod<STAGES, WN, BM, BK, BN>));
         dim3 block = {(WN<<5)+PRODUCER_THREADS, 1, 1};

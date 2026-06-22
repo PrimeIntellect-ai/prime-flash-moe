@@ -18,15 +18,15 @@ def generate_topk_ids(num_experts, num_tokens, top_k, balancedness=1.0):
 
 def pack_w1_for_kernel(w1):
     E, N, K = w1.shape
-    assert N % 256 == 0
-    H = N // 2
-    assert H % 128 == 0
+    assert (N&255) == 0
+    H = N>>1
+    assert (H&127) == 0
     gate = w1[:, :H, :]
     up = w1[:, H:, :]
     chunks = []
     for i in range(0, H, 128):
-        chunks.append(gate[:, i : i + 128, :])
-        chunks.append(up[:, i : i + 128, :])
+        chunks.append(gate[:, i : i+128, :])
+        chunks.append(up[:, i : i+128, :])
     return torch.cat(chunks, dim=1).contiguous()
 
 
@@ -71,20 +71,19 @@ def make_routing(topk_ids, block_m, num_experts):
     }
 
 
-def moe_native_grouped(x, w1, w2, topk_weights, top_k, routing, weighted=False):
+def moe_torch_grouped(x, w1, w2, topk_weights, top_k, routing):
     pair_sorted = routing['pair_sorted']
     offs = routing['offs']
     tok = pair_sorted // top_k
     route = pair_sorted % top_k
     xg = x[tok]
-    h = torch._grouped_mm(xg, w1.transpose(1, 2), offs, out_dtype=torch.bfloat16)
+    h = torch._grouped_mm(xg, w1, offs, out_dtype=torch.bfloat16)
     gate, up = h.chunk(2, dim=1)
-    act = torch.nn.functional.silu(gate.float()).to(torch.bfloat16) * up
-    yg = torch._grouped_mm(act, w2.transpose(1, 2), offs, out_dtype=torch.bfloat16)
-    if weighted:
-        yg = yg * topk_weights[tok, route].unsqueeze(1).to(torch.bfloat16)
+    act = torch.nn.functional.silu(gate.to(torch.float32)).to(torch.bfloat16) * up
+    yg = torch._grouped_mm(act, w2, offs, out_dtype=torch.bfloat16)
+    yg = yg * topk_weights[tok, route].unsqueeze(1).to(torch.bfloat16)
     out = torch.zeros_like(x)
-    out.index_add_(0, tok.long(), yg)
+    out.index_add_(0, tok.to(torch.int64), yg)
     return out
 
 
@@ -108,7 +107,7 @@ def moe_kernel(x, w1, w2, topk_weights, out, top_k, block_m, bn, wn, stages, rou
     return out
 
 
-def bench_cuda(fn, warmup=10, iters=1000):
+def bench_cuda(fn, warmup=10, iters=10):
     for _ in range(warmup):
         fn()
     torch.cuda.synchronize()
@@ -142,18 +141,20 @@ def run_one(num_tokens, K, E, N, top_k, block_m, bn, wn, stages, args):
     topk_ids = generate_topk_ids(E - 1, num_tokens, top_k - 1)
     forced = torch.full((num_tokens, 1), E - 1, device='cuda', dtype=torch.int32)
     topk_ids = torch.hstack((topk_ids, forced))
-    if args.weighted:
-        topk_weights = torch.nn.functional.softmax(
-            torch.randn((num_tokens, top_k), dtype=torch.float32, device='cuda'),
-            dim=-1,
-        )
-    else:
-        topk_weights = torch.ones((num_tokens, top_k), dtype=torch.float32, device='cuda')
+    topk_weights = torch.nn.functional.softmax(
+        torch.randn((num_tokens, top_k), dtype=torch.float32, device='cuda'),
+        dim=-1,
+    )
     routing = make_routing(topk_ids, block_m, E)
     out_kernel = torch.empty_like(x)
-    native_fn = lambda: moe_native_grouped(x, w1, w2, topk_weights, top_k, routing, weighted=args.weighted)
-    w1_packed = pack_w1_for_kernel(w1)
-    kernel_fn = lambda: moe_kernel(x, w1_packed, w2, topk_weights, out_kernel, top_k, block_m, bn, wn, stages, routing)
+    x_torch = x.contiguous()
+    w1_torch = w1.transpose(1, 2).contiguous()
+    w2_torch = w2.transpose(1, 2).contiguous()
+    x_fused = x.contiguous()
+    w1_fused = pack_w1_for_kernel(w1)
+    w2_fused = w2.contiguous()
+    native_fn = lambda: moe_torch_grouped(x_torch, w1_torch, w2_torch, topk_weights, top_k, routing)
+    kernel_fn = lambda: moe_kernel(x_fused, w1_fused, w2_fused, topk_weights, out_kernel, top_k, block_m, bn, wn, stages, routing)
     if args.check:
         ref = native_fn()
         got = kernel_fn()
@@ -243,30 +244,24 @@ def main():
     parser.add_argument('--warmup', type=int, default=10)
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--check', action='store_true')
-    parser.add_argument('--weighted', action='store_true')
     parser.add_argument('--plot', type=str, default='moe_bench.png')
     args = parser.parse_args()
 
     torch.cuda.set_device('cuda:0')
 
-    batch_sizes = [1<<i for i in range(6, 18)]
-    n_vals = [256, 512, 1024]
-    k_vals = [7168, 4096, 2048]
-    e_vals = [1<<i for i in range(3, 6)]
-
-    top_k = 10
+    batch_sizes = [8192, 16384, 32768]
+    n_vals = [2048, 3072, 4096]
+    k_vals = [2048, 3072, 4096]
+    e_vals = [8, 16, 32, 64]
+    top_k_vals = [4, 8]
     block_m = 128
-    configs = [(32, 8, 1)]
-
+    configs = [(32, 8, 4)]
     rows = []
-
-    for E, N, K, T, (bn, wn, stages) in itertools.product(e_vals, n_vals, k_vals, batch_sizes, configs):
-        print(f'bench T={T} E={E} N={N} K={K} bn={bn} wn={wn} stages={stages}')
-
+    for E, N, K, T, top_k, (bn, wn, stages) in itertools.product(e_vals, n_vals, k_vals, batch_sizes, top_k_vals, configs):
+        print(f'bench T={T} E={E} N={N} K={K} top_k={top_k} bn={bn} wn={wn} stages={stages}')
         try:
             row = run_one(T, K, E, N, top_k, block_m, bn, wn, stages, args)
             rows.append(row)
-
             print(
                 f'native={row["native_ms"]:.3f} ms '
                 f'kernel={row["kernel_ms"]:.3f} ms '
