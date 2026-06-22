@@ -36,8 +36,32 @@ namespace pi {
                  |0x160400000000000ull;
         }
 
-        [[nodiscard]] __device__ __forceinline__ uint32_t idesc_f32_bf16_bf16(int32_t m, int32_t n) {
-            return (1u<<4)|(1u<<7)|(1u<<10)|((static_cast<uint32_t>(n)>>3)<<17)|((static_cast<uint32_t>(m)>>4)<<24);
+        [[nodiscard]] constexpr __device__ __forceinline__ uint32_t idesc_f32_bf16_bf16(int32_t m, int32_t n) {
+            constexpr uint32_t sparsity_sel = 0; // ignored
+            constexpr uint32_t sparsity_mode = 0; // 0=dense,1=sparse
+            constexpr uint32_t sat_mode = 0; // 0=no sat, 1=sat
+            constexpr uint32_t mtype = 1u; // 1=f32
+            constexpr uint32_t atype = 1u; // 1=bf16
+            constexpr uint32_t btype = 1u; // 1=bf16
+            constexpr uint32_t aᵀ = 0u; // 1 = Aᵀ
+            constexpr uint32_t bᵀ = 0u; // 1 = Bᵀ
+            constexpr uint32_t an = 0u; // 1 = -A
+            constexpr uint32_t bn = 0u; // 1 = -B
+            constexpr uint32_t bws_shift = 0u; // no shift = 0 maximum shift of 8 = 1 maximum shift of 16 = 2 maximum shift of 32 = 3
+            return
+                (sparsity_sel & 3)
+                | ((sparsity_mode & 1)<<2)
+                | ((sat_mode & 1)<<3)
+                | ((mtype & 3)<<4)
+                | ((atype & 7)<<7)
+                | ((btype & 7)<<10)
+                | ((an & 1)<<13)
+                | ((bn & 1)<<14)
+                | ((aᵀ & 1)<<15)
+                | ((bᵀ & 1)<<16)
+                | (((static_cast<uint32_t>(n)>>3) & 63)<<17)
+                | (((static_cast<uint32_t>(m)>>4) & 31)<<24)
+                | ((bws_shift & 3)<<30);
         }
 
         [[nodiscard]] __device__ __forceinline__ uint32_t tmem_addr(uint32_t base, uint32_t row, uint32_t col) {
@@ -51,8 +75,7 @@ namespace pi {
             uint32_t idesc,
             int32_t enable_input_d
         ) {
-            uint32_t mask[4] = {0, 0, 0, 0};
-            uint64_t idescE = static_cast<uint64_t>(idesc) << 32;
+            constexpr uint32_t mask[4] = {};
             asm volatile(
                 "{\n\t"
                 ".reg .pred p;\n\t"
@@ -61,7 +84,7 @@ namespace pi {
                 "}\n"
                 :
                 : "r"(d_tmem), "l"(desc_a), "l"(desc_b),
-                  "r"(static_cast<uint32_t>(idescE>>32)),
+                  "r"(idesc),
                   "r"(enable_input_d),
                   "r"(mask[0]), "r"(mask[1]), "r"(mask[2]), "r"(mask[3])
                 : "memory"
