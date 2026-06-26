@@ -30,14 +30,50 @@ namespace pi {
     }
 
     namespace tcgen05 {
-        [[nodiscard]] __device__ __forceinline__ uint64_t smem_desc_kmajor(const void *ptr, int32_t height) {
-            return ((static_cast<uint64_t>(static_cast<uint32_t>(__cvta_generic_to_shared(ptr)))&0x3ffffu)>>4)
-                 |(((static_cast<uint64_t>(height<<4)&0x3ffffu)>>4)<<16)|(((static_cast<uint64_t>(128)&0x3ffffu)>>4)<<32)
-                 |0x160400000000000ull;
+        [[nodiscard]] __device__ __forceinline__ uint64_t encode_smem_desc(const void *p, int32_t height) {
+            constexpr uint64_t stride_dim = 128;            // stride dim N
+            constexpr uint64_t mat_base_offs = 0;           // mat base offset
+            constexpr uint64_t lead_dim_stride_mod = 0;     // leading dim stride mode, 0=byte offs rel, 1=byte offs abs
+            constexpr uint64_t swizzling_mode = 0;          // swizzle mode, 0=no swizzling, 1=128B with 32B atomic swizzling, 2=128B swizzling, 4=64B swizzling, 6=32B swizzling
+            static_assert(!swizzling_mode || !(swizzling_mode&(swizzling_mode-1))); 
+            auto mat_start_addr = static_cast<uint32_t>(__cvta_generic_to_shared(p));
+            return
+                ((mat_start_addr>>4)&((1ull<<14ull)-1ull))
+                | ((((static_cast<uint64_t>(height & ((1ull<<14ull)-1ull)))))<<16)  // mat desc
+                | ((((stride_dim>>4))&((1ull<<14ull)-1ull))<<32)                    // stride dim byte offset
+                | ((0b1ull&3)<<46)                                                  // fixed const
+                | ((mat_base_offs & 7)<<49)
+                | ((lead_dim_stride_mod & 1)<<52)
+                | (0xb0ull<<53)                                                     // fixed const
+                | ((swizzling_mode & 7)<<61);
         }
 
-        [[nodiscard]] __device__ __forceinline__ uint32_t idesc_f32_bf16_bf16(int32_t m, int32_t n) {
-            return (1u<<4)|(1u<<7)|(1u<<10)|((static_cast<uint32_t>(n)>>3)<<17)|((static_cast<uint32_t>(m)>>4)<<24);
+        [[nodiscard]] constexpr __device__ __forceinline__ uint32_t encode_idesc_format_1(int32_t m, int32_t n) {
+            constexpr uint32_t sparsity_sel = 0; // ignored
+            constexpr uint32_t sparsity_mode = 0; // 0=dense,1=sparse
+            constexpr uint32_t sat_mode = 0; // 0=no sat, 1=sat
+            constexpr uint32_t mtype = 1u; // 1=f32
+            constexpr uint32_t atype = 1u; // 1=bf16
+            constexpr uint32_t btype = 1u; // 1=bf16
+            constexpr uint32_t aᵀ = 0u; // 1 = Aᵀ
+            constexpr uint32_t bᵀ = 0u; // 1 = Bᵀ
+            constexpr uint32_t an = 0u; // 1 = -A
+            constexpr uint32_t bn = 0u; // 1 = -B
+            constexpr uint32_t bws_shift = 0u; // no shift = 0 maximum shift of 8 = 1 maximum shift of 16 = 2 maximum shift of 32 = 3
+            return
+                (sparsity_sel & 3)
+                | ((sparsity_mode & 1)<<2)
+                | ((sat_mode & 1)<<3)
+                | ((mtype & 3)<<4)
+                | ((atype & 7)<<7)
+                | ((btype & 7)<<10)
+                | ((an & 1)<<13)
+                | ((bn & 1)<<14)
+                | ((aᵀ & 1)<<15)
+                | ((bᵀ & 1)<<16)
+                | (((static_cast<uint32_t>(n)>>3) & 63)<<17)
+                | (((static_cast<uint32_t>(m)>>4) & 31)<<24)
+                | ((bws_shift & 3)<<30);
         }
 
         [[nodiscard]] __device__ __forceinline__ uint32_t tmem_addr(uint32_t base, uint32_t row, uint32_t col) {
@@ -51,8 +87,7 @@ namespace pi {
             uint32_t idesc,
             int32_t enable_input_d
         ) {
-            uint32_t mask[4] = {0, 0, 0, 0};
-            uint64_t idescE = static_cast<uint64_t>(idesc) << 32;
+            constexpr uint32_t mask[4] = {};
             asm volatile(
                 "{\n\t"
                 ".reg .pred p;\n\t"
@@ -61,7 +96,7 @@ namespace pi {
                 "}\n"
                 :
                 : "r"(d_tmem), "l"(desc_a), "l"(desc_b),
-                  "r"(static_cast<uint32_t>(idescE>>32)),
+                  "r"(idesc),
                   "r"(enable_input_d),
                   "r"(mask[0]), "r"(mask[1]), "r"(mask[2]), "r"(mask[3])
                 : "memory"
@@ -166,37 +201,37 @@ namespace pi {
         }
     }
 
-    namespace barrier {
-        __device__ __forceinline__ void init(uint64_t *bar, int32_t threads, int32_t transactions) {
+    struct barrier final {
+        __device__ __forceinline__ void init(int32_t threads, int32_t transactions=0) {
             asm volatile(
                 "mbarrier.init.shared::cta.b64 [%0], %1;\n"
-                :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(bar))), "r"(threads+transactions)
+                :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(this))), "r"(threads+transactions)
             );
         }
 
-        __device__ __forceinline__ void arrive_cp_async_mem(uint64_t *bar) {
+        __device__ __forceinline__ void arrive_cp_async_mem() {
             asm volatile(
                 "cp.async.mbarrier.arrive.noinc.shared.b64 [%0];\n"
-                :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(bar)))
+                :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(this)))
             );
         }
 
-        __device__ __forceinline__ void arrive(uint64_t *bar, uint32_t num=1) {
+        __device__ __forceinline__ void arrive(uint32_t num=1) {
             asm volatile(
                 "mbarrier.arrive.shared.b64 _, [%0], %1;\n"
-                :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(bar))), "r"(num)
+                :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(this))), "r"(num)
                 : "memory"
             );
         }
 
-        __device__ __forceinline__ void expect_nb(uint64_t *bar, uint32_t nb) {
+        __device__ __forceinline__ void expect_nb(uint32_t nb) {
             asm volatile(
                 "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;\n"
-                :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(bar))), "r"(nb)
+                :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(this))), "r"(nb)
             );
         }
 
-        __device__ __forceinline__ void await(uint64_t *bar, int32_t phase) {
+        __device__ __forceinline__ void await(int32_t phase) {
             asm volatile(
                 "{\n"
                 ".reg .pred P1;\n"
@@ -204,10 +239,17 @@ namespace pi {
                 "mbarrier.try_wait.parity.shared.b64 P1, [%0], %1;\n"
                 "@!P1 bra.uni AWAIT;\n"
                 "}\n"
-                :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(bar))), "r"(phase)
+                :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(this))), "r"(phase)
             );
         }
-    }
+
+        constexpr __device__ __host__ __forceinline__ uint64_t *operator*() noexcept { return &m_handle; }
+        constexpr __device__ __host__ __forceinline__ const uint64_t *operator*() const noexcept { return &m_handle; }
+      
+    private:
+        uint64_t m_handle;
+    };
+    static_assert(sizeof(barrier) == sizeof(uint64_t) && alignof(barrier) == alignof(uint64_t));
 
     [[nodiscard]] static __device__ __forceinline__ float swiglu(float x, float w) {
         return w*(x/(1.f+__expf(-x)));
@@ -255,9 +297,9 @@ namespace pi {
         static constexpr int32_t TC_N = WN*BN;
 
         extern __shared__ __align__(1024) uint8_t smem_raw[];
-        __shared__ __align__(8) uint64_t bar_copy[STAGES];
-        __shared__ __align__(8) uint64_t bar_recycle[STAGES];
-        __shared__ __align__(8) uint64_t bar_mma[STAGES];
+        __shared__ __align__(8) barrier bar_copy[STAGES];
+        __shared__ __align__(8) barrier bar_recycle[STAGES];
+        __shared__ __align__(8) barrier bar_mma[STAGES];
         __shared__ __align__(4) uint32_t tmem_acc;
         __shared__ float topk_scales[BM];
         __shared__ int32_t row_tok[BM];
@@ -274,9 +316,9 @@ namespace pi {
         warp_id >>= 5;
         if (!threadIdx.x) {
             for (int32_t i = 0; i < STAGES; ++i) {
-                barrier::init(bar_copy+i, PRODUCER_THREADS+1, 0);
-                barrier::init(bar_recycle+i, CONSUMER_THREADS, 0);
-                barrier::init(bar_mma+i, 1, 0);
+                bar_copy[i].init(PRODUCER_THREADS+1);
+                bar_recycle[i].init(CONSUMER_THREADS);
+                bar_mma[i].init(1);
             }
             asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
         }
@@ -295,7 +337,7 @@ namespace pi {
             }
         }
         __syncthreads();
-        auto con_sync = [=]() { asm volatile ("bar.sync 0, %0;\n" :: "n"(CONSUMER_THREADS)); };
+        auto con_sync = [=]() { asm volatile ("bar.sync 1, %0;\n" :: "n"(CONSUMER_THREADS)); };
         int32_t n_stages_up = K / BLOCK_SHAPE_K;
         int32_t n_stages_down = N2 / BN2;
         int32_t phase = 0;
@@ -309,25 +351,25 @@ namespace pi {
                     phase^=1;
                     smem_stage = 0;
                 }
-                const int32_t offs = stage*BK;
-                barrier::await(bar_recycle+smem_stage, phase);
+                int32_t offs = stage*BK;
+                bar_recycle[smem_stage].await(phase);
                 for (int32_t wave=0; wave < BM/ROWS_PER_WAVE; ++wave) {
-                    const int32_t row_in_block = wave*ROWS_PER_WAVE+(threadIdx.x/CHUNKS_PER_ROW);
-                    const int32_t k8 = threadIdx.x&(CHUNKS_PER_ROW-1);
-                    const int32_t tok = row_tok[row_in_block];
+                    int32_t row_in_block = wave*ROWS_PER_WAVE+(threadIdx.x/CHUNKS_PER_ROW);
+                    int32_t k8 = threadIdx.x&(CHUNKS_PER_ROW-1);
+                    int32_t tok = row_tok[row_in_block];
                     if (row_in_block < BM && tok >= 0 && tok < M) {
                         auto *dst = smem_up.x+smem_stage*XS+((k8*BM + row_in_block)<<3);
                         const uint4 *src = reinterpret_cast<const uint4 *>(x+tok*K+offs+(k8<<3));
                         cp_async::cg256<TB>(static_cast<uint32_t>(__cvta_generic_to_shared(dst)), src);
                     }
                 }
-                barrier::arrive_cp_async_mem(bar_copy+smem_stage);
+                bar_copy[smem_stage].arrive_cp_async_mem();
                 if (!threadIdx.x) {
-                    barrier::expect_nb(bar_copy+smem_stage, WS*sizeof(__nv_bfloat16));
+                    bar_copy[smem_stage].expect_nb(WS*sizeof(__nv_bfloat16));
                     cp_async::load3d(
                         smem_up.w+smem_stage*WS,
                         &map_w,
-                        bar_copy+smem_stage,
+                        *bar_copy[smem_stage],
                         0,
                         expert_idx*N+blockIdx.x*(WN*BN),
                         offs>>3
@@ -341,19 +383,19 @@ namespace pi {
                     phase^=1;
                     smem_stage = 0;
                 }
-                barrier::await(bar_recycle+smem_stage, phase);
+                bar_recycle[smem_stage].await(phase);
                 if (!threadIdx.x) {
-                    barrier::expect_nb(bar_copy+smem_stage, WS*sizeof(__nv_bfloat16));
+                    bar_copy[smem_stage].expect_nb(WS*sizeof(__nv_bfloat16));
                     cp_async::load3d(
                         smem_down.w+smem_stage*WS,
                         &map_w2,
-                        bar_copy+smem_stage,
+                        *bar_copy[smem_stage],
                         0,
                         expert_idx*N2+stage*BN2,
                         (blockIdx.x*BK2) / 8
                     );
                 }
-                barrier::arrive_cp_async_mem(bar_copy+smem_stage);
+                bar_copy[smem_stage].arrive_cp_async_mem();
                 ++smem_stage;
             }
         };
@@ -364,28 +406,28 @@ namespace pi {
                 int32_t tdest = sorted_token_ids[warp_m*BM+(threadIdx.x - PRODUCER_THREADS)];
                 if (tdest >= 0) tok_src = tdest / top_k;
             }
-            for (int32_t i=0; i < STAGES; ++i) barrier::arrive(bar_recycle+i);
-            uint32_t idesc = tcgen05::idesc_f32_bf16_bf16(BM, TC_N);
+            for (int32_t i=0; i < STAGES; ++i) bar_recycle[i].arrive();
+            uint32_t idesc = tcgen05::encode_idesc_format_1(BM, TC_N);
             int32_t smem_stage = 0;
             for (int32_t stage = 0; stage < n_stages_up; ++stage) {
                 if (smem_stage == STAGES) {
                     phase^=1;
                     smem_stage = 0;
                 }
-                barrier::await(bar_copy+smem_stage, phase);
+                bar_copy[smem_stage].await(phase);
                 if (warp_id == 0 && lane_id == 0) {
                     #pragma unroll
                     for (int32_t k16=0; k16 < BK>>4; ++k16) {
                         auto *__restrict__ a_ptr = smem_up.x+smem_stage*XS+((k16*BM)<<4);
                         auto *__restrict__ b_ptr = smem_up.w+smem_stage*WS+((k16*TC_N)<<4);
-                        uint64_t a_desc = tcgen05::smem_desc_kmajor(a_ptr, BM);
-                        uint64_t b_desc = tcgen05::smem_desc_kmajor(b_ptr, TC_N);
+                        uint64_t a_desc = tcgen05::encode_smem_desc(a_ptr, BM);
+                        uint64_t b_desc = tcgen05::encode_smem_desc(b_ptr, TC_N);
                         tcgen05::mma_f16(tmem_acc, a_desc, b_desc, idesc, stage||k16);
                     }
-                    tcgen05::commit_mbarrier(bar_mma+smem_stage);
+                    tcgen05::commit_mbarrier(*bar_mma[smem_stage]);
                 }
-                barrier::await(bar_mma+smem_stage, phase);
-                barrier::arrive(bar_recycle+smem_stage);
+                bar_mma[smem_stage].await(phase);
+                bar_recycle[smem_stage].arrive();
                 ++smem_stage;
             }
             con_sync();
@@ -394,7 +436,7 @@ namespace pi {
             if (warp_id < 4) {
                 int32_t row = (warp_id<<5)+lane_id;
                 #pragma unroll
-                for (int32_t c8 = 0; c8 < BK2>>3; ++c8) {
+                for (int32_t c8=0; c8 < BK2>>3; ++c8) {
                     float gate[8];
                     float up[8];
                     tcgen05::ld_32x32b_x8(gate, tcgen05::tmem_addr(tmem_acc, row, (c8<<3)));
@@ -412,14 +454,14 @@ namespace pi {
                     phase^=1;
                     smem_stage = 0;
                 }
-                barrier::await(bar_copy+smem_stage, phase);
+                bar_copy[smem_stage].await(phase);
                 if (warp_id == 0 && lane_id == 0) {
                     #pragma unroll
-                    for (int32_t k16 = 0; k16 < BK2 / 16; ++k16) {
-                        __nv_bfloat16 *a_ptr = smem_down.x+k16*BM*16;
-                        __nv_bfloat16 *b_ptr = smem_down.w+smem_stage*WS+k16*BN2*16;
-                        uint64_t a_desc = tcgen05::smem_desc_kmajor(a_ptr, BM);
-                        uint64_t b_desc = tcgen05::smem_desc_kmajor(b_ptr, BN2);
+                    for (int32_t k16=0; k16 < BK2>>4; ++k16) {
+                        __nv_bfloat16 *a_ptr = smem_down.x+((k16*BM)<<4);
+                        __nv_bfloat16 *b_ptr = smem_down.w+smem_stage*WS+((k16*BN2)<<4);
+                        uint64_t a_desc = tcgen05::encode_smem_desc(a_ptr, BM);
+                        uint64_t b_desc = tcgen05::encode_smem_desc(b_ptr, BN2);
                         tcgen05::mma_f16(
                             tmem_acc,
                             a_desc,
@@ -428,16 +470,17 @@ namespace pi {
                             k16 != 0
                         );
                     }
-                    tcgen05::commit_mbarrier(bar_mma+smem_stage);
+                    tcgen05::commit_mbarrier(*bar_mma[smem_stage]);
                 }
-                barrier::await(bar_mma+smem_stage, phase);
-                barrier::arrive(bar_recycle+smem_stage);
+                bar_mma[smem_stage].await(phase);
+                bar_recycle[smem_stage].arrive();
                 asm volatile("cp.async.bulk.wait_group 0;\n");
                 cuda::ptx::fence_proxy_async(cuda::ptx::space_shared);
                 con_sync();
                 tcgen05::after_thread_sync();
                 if (warp_id < 4) {
-                    const int32_t row = (warp_id<<5)+lane_id;
+                    int32_t row = (warp_id<<5)+lane_id;
+                    float scale = topk_scales[row];
                     #pragma unroll
                     for (int32_t c8=0; c8 < BN2>>3; ++c8) {
                         float vals[8];
@@ -446,7 +489,7 @@ namespace pi {
                         __nv_bfloat16 *dst = smem_down.out+row*PAD+(c8<<3);
                         #pragma unroll
                         for (int32_t e=0; e < 8; ++e) {
-                            dst[e] = __float2bfloat16(vals[e]);
+                            dst[e] = __float2bfloat16(scale*vals[e]);
                         }
                     }
                 }
@@ -548,7 +591,7 @@ namespace pi {
         int32_t block_m,
         cudaStream_t stream
     ) {
-        static constexpr auto BK = 128;
+        static constexpr auto BK = 64;
         static constexpr auto PRODUCER_THREADS = 128;
         static constexpr size_t SMEM = std::max(sizeof(smem_up_pod<STAGES, WN, BM, BK, BN>), sizeof(smem_down_pod<STAGES, WN, BM, BK, BN>));
         dim3 block = {(WN<<5)+PRODUCER_THREADS, 1, 1};
