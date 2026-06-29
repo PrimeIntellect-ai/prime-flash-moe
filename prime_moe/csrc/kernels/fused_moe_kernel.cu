@@ -7,6 +7,7 @@
 #include <cuda.h>
 #include <cudaTypedefs.h>
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
 
 namespace pi {
     static std::once_flag g_dlsym_once;
