@@ -7,6 +7,12 @@
 #include <torch/library.h>
 #include <torch/extension.h>
 
+extern void void fused_rmsnorm_residual_forward(
+        __nv_fp8_e4m3* __restrict__ vals, __nv_fp8_e8m0* __restrict__ scales, float* rrms,
+        const nv_bfloat16* branch, const nv_bfloat16* residual,
+        const nv_bfloat16* weight,
+        float epsilon, int N, int C, cudaStream_t stream);
+
 namespace pi {
     extern void fused_moe_bf16(
         const __nv_bfloat16 *x,
@@ -91,6 +97,59 @@ namespace pi {
             stream
         );
     }
+
+    void fused_rmsnorm_residual_stub(
+            const at::Tensor& branch,
+            const at::Tensor& residual,
+            const at::Tensor& weight,
+            double epsilon,
+            at::Tensor& vals,
+            at::Tensor& scales,
+            at::Tensor& rrms
+    ){
+        cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+        at::cuda::OptionalCUDAGuard device_guard {device_of(branch)};
+
+        // check inputs
+        TORCH_CHECK(branch.scalar_type() == at::kBFloat16);
+        TORCH_CHECK(residual.scalar_type() == at::kBFloat16);
+        TORCH_CHECK(weight.scalar_type() == at::kBFloat16);
+        TORCH_CHECK(branch.is_contiguous());
+        TORCH_CHECK(residual.is_contiguous());
+        TORCH_CHECK(weight.is_contiguous());
+
+        const int64_t C = branch.size(-1);
+        const int64_t N = branch.numel() / C;
+
+        TORCH_CHECK(residual.sizes() == branch.sizes());
+        TORCH_CHECK(weight.dim() == 1 && weight.numel() == C);
+        TORCH_CHECK(C % 128 == 0);
+        TORCH_CHECK(N % 128 == 0);
+        TORCH_CHECK(N <= std::numeric_limits<int>::max());
+
+        // check outputs
+        TORCH_CHECK(vals.scalar_type() == at::kFloat8_e4m3fn);
+        TORCH_CHECK(scales.scalar_type() == at::kFloat8_e8m0fnu);
+        TORCH_CHECK(rrms.scalar_type() == at::kFloat);
+
+        TORCH_CHECK(vals.is_contiguous());
+        TORCH_CHECK(scales.is_contiguous());
+        TORCH_CHECK(rrms.is_contiguous());
+
+        TORCH_CHECK(vals.sizes() == branch.sizes());
+        TORCH_CHECK(rrms.dim() == 1 && rrms.numel() == N);
+        TORCH_CHECK(scales.numel() == N * C / 32);
+
+        fused_rmsnorm_residual_forward(
+                reinterpret_cast<__nv_fp8_e4m3*>(vals.data_ptr()),
+                reinterpret_cast<__nv_fp8_e8m0*>(scales.data_ptr()),
+                rrms.data_ptr<float>(),
+                reinterpret_cast<const nv_bfloat16*>(branch.const_data_ptr()),
+                reinterpret_cast<const nv_bfloat16*>(residual.const_data_ptr()),
+                reinterpret_cast<const nv_bfloat16*>(weight.const_data_ptr()),
+                static_cast<float>(epsilon),
+                static_cast<int>(N), static_cast<int>(C), stream);
+    }
 }
 
 TORCH_LIBRARY_FRAGMENT(prime_moe, m) {
@@ -110,7 +169,18 @@ TORCH_LIBRARY_FRAGMENT(prime_moe, m) {
         "int stages"
         ") -> ()"
     );
+    m.def("fused_rmsnorm_residual("
+          "Tensor branch, "
+          "Tensor residual, "
+          "Tensor weight, "
+          "float epsilon, "
+          "Tensor(a!) vals, "
+          "Tensor(b!) scales, "
+          "Tensor(c!) rrms"
+          ") -> ()");
+
     m.impl("fused_moe_bf16", torch::kCUDA, &pi::fused_moe_bf16_torch_stub);
+    m.impl("fused_rmsnorm_residual", torch::kCUDA, &pi::fused_rmsnorm_residual_stub);
 }
 
 PYBIND11_MODULE(_C, m) {}
