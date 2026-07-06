@@ -37,7 +37,7 @@ __global__ void fused_rmsnorm_residual_forward_kernel(
         __nv_fp8_e4m3* __restrict__ vals, __nv_fp8_e8m0* __restrict__ scales, float* __restrict__ rrms,
         const nv_bfloat16* __restrict__ branch, const nv_bfloat16* __restrict__ residual,
         const nv_bfloat16* __restrict__ weight, float epsilon,
-        int N, int C) {
+        int N, int C, float inv_c) {
     using bf16x16 = GenericVector<nv_bfloat16, 16>;
     using fp8x16 = GenericVector<__nv_fp8_e4m3, 16>;
     constexpr const int WARP_SIZE = 32;
@@ -66,7 +66,7 @@ __global__ void fused_rmsnorm_residual_forward_kernel(
         }
     }
 
-    sum_squared = cg::reduce(warp, sum_squared, cg::plus<float>{}) / C;
+    sum_squared = cg::reduce(warp, sum_squared, cg::plus<float>{}) * inv_c;
     float s = rsqrtf(sum_squared + epsilon);
 
     for(int c = threadIdx.x * bf16x16::size; c < C; c += WARP_SIZE * bf16x16::size) {
@@ -122,5 +122,5 @@ void fused_rmsnorm_residual_forward(
     const int grid_size = (N + block_y - 1) / block_y;
 
     fused_rmsnorm_residual_forward_kernel<<<grid_size, dim3(32, block_y), 0, stream>>>(
-            vals, scales, rrms, branch, residual, weight, epsilon, N, C);
+            vals, scales, rrms, branch, residual, weight, epsilon, N, C, 1.f/C);
 }
