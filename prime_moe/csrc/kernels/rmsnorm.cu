@@ -32,6 +32,18 @@ __device__ __forceinline__ int64_t get_sf_out_offset(
     return SFOffset;
 }
 
+// mixed-precision FMA
+__device__ __forceinline__ float fma(nv_bfloat16 a, nv_bfloat16 b, float c) {
+    __asm ("fma.rn.f32.bf16 %0, %1, %2, %0;\n"
+            :"+f"(c)
+            :"h"(__bfloat16_as_short(a)), "h"(__bfloat16_as_short(b)));
+    return c;
+}
+
+__device__ __forceinline__ float fmul(nv_bfloat16 a, nv_bfloat16 b) {
+    return fma(a, b, 0.f);
+}
+
 
 __global__ void fused_rmsnorm_residual_forward_kernel(
         __nv_fp8_e4m3* __restrict__ vals, __nv_fp8_e8m0* __restrict__ scales, float* __restrict__ rrms,
@@ -61,8 +73,7 @@ __global__ void fused_rmsnorm_residual_forward_kernel(
     for(int c = threadIdx.x * bf16x16::size; c < C; c += WARP_SIZE * bf16x16::size) {
         const bf16x16 in1 = bf16x16::load_cs(branch + c);
         for(int k = 0; k < bf16x16::size; ++k) {
-            float data_k = __bfloat162float(in1[k]);
-            sum_squared += data_k * data_k;
+            sum_squared = fma(in1[k], in1[k], sum_squared);
         }
     }
 
