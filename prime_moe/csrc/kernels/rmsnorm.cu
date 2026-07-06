@@ -97,10 +97,12 @@ __global__ void fused_rmsnorm_residual_forward_kernel(
         }
 
         nv_bfloat16 group_amax = cg::reduce(quant_group, local_max, cg::greater<nv_bfloat16>{});
-        float scale_factor = __bfloat162float(group_amax) / 448.f;
+        constexpr float one_over_448 = 1.f / 448.f;
+        float scale_factor = __bfloat162float(group_amax) * one_over_448;
         __nv_fp8_storage_t sf = __nv_cvt_float_to_e8m0(scale_factor, __NV_SATFINITE, cudaRoundPosInf);
         // by construction, E8M0 can't be zero
-        nv_bfloat16 inv_sf = __float2bfloat16(1.f) / nv_bfloat16(__nv_cvt_e8m0_to_bf16raw(sf));
+        // V = 2^(SF - 127) => for 1.0 / V: SF' = 127 - SF; add 127 for bias
+        nv_bfloat16 inv_sf = nv_bfloat16(__nv_cvt_e8m0_to_bf16raw(254-sf));
 
         fp8x16 quantized;
         for(int k = 0; k < bf16x16::size; ++k) {
