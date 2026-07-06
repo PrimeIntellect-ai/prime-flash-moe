@@ -53,13 +53,15 @@ __global__ __launch_bounds__(128) void fused_rmsnorm_residual_forward_kernel(
     using bf16x16 = GenericVector<nv_bfloat16, 16>;
     using fp8x16 = GenericVector<__nv_fp8_e4m3, 16>;
     constexpr const int WARP_SIZE = 32;
-    assert(blockDim.x == WARP_SIZE);
+    constexpr const int BLOCK_SIZE = 128;
 
     const cg::thread_block block = cg::this_thread_block();
     const cg::thread_block_tile<WARP_SIZE> warp = cg::tiled_partition<WARP_SIZE>(block);
     const cg::thread_block_tile<2> quant_group = cg::tiled_partition<2>(block);
-    long idx = blockIdx.x * blockDim.y + threadIdx.y;
+    long idx = blockIdx.x;
     if(idx >= N) return;
+
+    __shared__ __align__(16) float sum_squared_com[BLOCK_SIZE / WARP_SIZE];
 
     // adjust pointers to current token
     vals += C * idx;
@@ -70,17 +72,24 @@ __global__ __launch_bounds__(128) void fused_rmsnorm_residual_forward_kernel(
     // i.e. out = rmsnorm(branch) * weight + residual.
     float sum_squared = 0.f;
 
-    for(int c = threadIdx.x * bf16x16::size; c < C; c += WARP_SIZE * bf16x16::size) {
-        const bf16x16 in1 = bf16x16::load_cs(branch + c);
+    for(int c = threadIdx.x * bf16x16::size; c < C; c += BLOCK_SIZE * bf16x16::size) {
+        const bf16x16 in1 = bf16x16::load(branch + c);
         for(int k = 0; k < bf16x16::size; ++k) {
             sum_squared = fma(in1[k], in1[k], sum_squared);
         }
     }
 
     sum_squared = cg::reduce(warp, sum_squared, cg::plus<float>{}) * inv_c;
+    if(warp.thread_rank() == 0) {
+        sum_squared_com[warp.meta_group_rank()] = sum_squared;
+    }
+    static_assert(BLOCK_SIZE / WARP_SIZE == 4);
+    block.sync();
+    float4 all_ss = *reinterpret_cast<float4*>(sum_squared_com);
+    sum_squared = all_ss.x + all_ss.y + all_ss.z + all_ss.w;
     float s = rsqrtf(sum_squared + epsilon);
 
-    for(int c = threadIdx.x * bf16x16::size; c < C; c += WARP_SIZE * bf16x16::size) {
+    for(int c = threadIdx.x * bf16x16::size; c < C; c += BLOCK_SIZE * bf16x16::size) {
         const bf16x16 in1 = bf16x16::load_cs(branch + c);
         const bf16x16 w = bf16x16::load(weight + c);
         const bf16x16 in2 = bf16x16::load_cs(residual + c);
@@ -117,7 +126,7 @@ __global__ __launch_bounds__(128) void fused_rmsnorm_residual_forward_kernel(
     }
 
     // cache the rrms for the backward pass later
-    if(warp.thread_rank() == 0) {
+    if(block.thread_rank() == 0) {
         rrms[idx] = s;
     }
 }
@@ -131,9 +140,7 @@ void fused_rmsnorm_residual_forward(
     assert(C % 128 == 0);
     assert(N % 128 == 0);
     const int block_size = 128;
-    int block_y = block_size / 32;
-    const int grid_size = (N + block_y - 1) / block_y;
 
-    fused_rmsnorm_residual_forward_kernel<<<grid_size, dim3(32, block_y), 0, stream>>>(
+    fused_rmsnorm_residual_forward_kernel<<<N, block_size, 0, stream>>>(
             vals, scales, rrms, branch, residual, weight, epsilon, N, C, 1.f/C);
 }
