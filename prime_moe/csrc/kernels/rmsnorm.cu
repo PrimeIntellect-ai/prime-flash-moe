@@ -45,7 +45,7 @@ __device__ __forceinline__ float fmul(nv_bfloat16 a, nv_bfloat16 b) {
 }
 
 
-__global__ void fused_rmsnorm_residual_forward_kernel(
+__global__ __launch_bounds__(128) void fused_rmsnorm_residual_forward_kernel(
         __nv_fp8_e4m3* __restrict__ vals, __nv_fp8_e8m0* __restrict__ scales, float* __restrict__ rrms,
         const nv_bfloat16* __restrict__ branch, const nv_bfloat16* __restrict__ residual,
         const nv_bfloat16* __restrict__ weight, float epsilon,
@@ -130,7 +130,7 @@ void fused_rmsnorm_residual_forward(
 {
     assert(C % 128 == 0);
     assert(N % 128 == 0);
-    const int block_size = 256;
+    const int block_size = 128;
     int block_y = block_size / 32;
     const int grid_size = (N + block_y - 1) / block_y;
 
