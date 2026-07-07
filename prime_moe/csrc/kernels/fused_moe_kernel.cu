@@ -7,6 +7,7 @@
 #include <cuda.h>
 #include <cudaTypedefs.h>
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
 
 namespace pi {
     static std::once_flag g_dlsym_once;
@@ -287,7 +288,7 @@ namespace pi {
         static_assert(WN*BN == 256, "tcgen05 path assumes 256 output columns per MMA tile.");
 
         static constexpr int32_t CONSUMER_THREADS = WN<<5;
-        static constexpr int32_t BLOCK_SHAPE_K = 128;
+        static constexpr int32_t BLOCK_SHAPE_K = BK;
         static constexpr int32_t BK2 = (WN*BN)>>1;
         static constexpr int32_t BN2 = BK<<1;
         static constexpr int32_t WS = WN*BK*BN;
