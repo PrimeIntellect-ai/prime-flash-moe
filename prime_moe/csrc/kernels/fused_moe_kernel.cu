@@ -256,20 +256,20 @@ namespace pi {
         return w*(x/(1.f+__expf(-x)));
     }
 
-    template <const int32_t STAGES, const int32_t WN, const int32_t BM, const int32_t BK, const int32_t BN>
+    template <const int32_t STAGES, const int32_t WN, const int32_t BM, const int32_t BK, const int32_t BN, const int32_t BPC>
     struct smem_up_pod {
         alignas(1024) __nv_bfloat16 w[STAGES*WN*BK*BN];
-        alignas(1024) __nv_bfloat16 x[STAGES*BK*BM];
+        alignas(1024) __nv_bfloat16 x[STAGES*BK*BM*BPC];
     };
 
-    template <const int32_t STAGES, const int32_t WN, const int32_t BM, const int32_t BK, const int32_t BN>
+    template <const int32_t STAGES, const int32_t WN, const int32_t BM, const int32_t BK, const int32_t BN, const int32_t BPC>
     struct smem_down_pod {
         alignas(1024) __nv_bfloat16 w[STAGES*WN*BK*BN];
-        alignas(1024) __nv_bfloat16 x[BM*WN*BN/2];
+        alignas(1024) __nv_bfloat16 x[BM*WN*BN/2*BPC];
         alignas(16) __nv_bfloat16 out[BM*(BK*2+8)];
     };
 
-    template <const int32_t BM, const int32_t BK, const int32_t BN, const int32_t WN, const int32_t STAGES, const int32_t PRODUCER_THREADS>
+    template <const int32_t BM, const int32_t BK, const int32_t BN, const int32_t WN, const int32_t STAGES, const int32_t PRODUCER_THREADS, const int32_t BPC>
     static __global__ __launch_bounds__(WN*32+PRODUCER_THREADS) void fused_moe_kernel(
         const __nv_bfloat16 *__restrict__ x,
         const __grid_constant__ CUtensorMap map_w,
@@ -285,31 +285,34 @@ namespace pi {
         int32_t N
     ) {
         static_assert(BM == 128, "tcgen05 path: BM=128 / Layout-D only.");
-        static_assert(WN*BN == 256, "tcgen05 path assumes 256 output columns per MMA tile.");
+        static_assert(WN*BN == 256, "tcgen05 path asumes 256 output columns per MMA tile.");
+        static_assert(256*BPC <= 512, "tmem holds at most 512 columns (BPC*256 acc).");
 
         static constexpr int32_t CONSUMER_THREADS = WN<<5;
         static constexpr int32_t BLOCK_SHAPE_K = BK;
         static constexpr int32_t BK2 = (WN*BN)>>1;
         static constexpr int32_t BN2 = BK<<1;
         static constexpr int32_t WS = WN*BK*BN;
-        static constexpr int32_t XS = BK*BM;
+        static constexpr int32_t XS = BK*BM;           // up x per block and stages
+        static constexpr int32_t DXS = BM*WN*BN/2;     // down x per block
         static constexpr int32_t TB = 16;
         static constexpr int32_t PAD = BN2+8;
         static constexpr int32_t TC_N = WN*BN;
+        static constexpr int32_t ACC = 256;   // tmem columns per block accumulator
 
         extern __shared__ __align__(1024) uint8_t smem_raw[];
         __shared__ __align__(8) barrier bar_copy[STAGES];
         __shared__ __align__(8) barrier bar_recycle[STAGES];
         __shared__ __align__(8) barrier bar_mma[STAGES];
         __shared__ __align__(4) uint32_t tmem_acc;
-        __shared__ float topk_scales[BM];
-        __shared__ int32_t row_tok[BM];
+        __shared__ float topk_scales[BM*BPC];
+        __shared__ int32_t row_tok[BM*BPC];
 
-        auto &smem_up = *reinterpret_cast<smem_up_pod<STAGES, WN, BM, BK, BN> *>(smem_raw);
+        auto &smem_up = *reinterpret_cast<smem_up_pod<STAGES, WN, BM, BK, BN, BPC> *>(smem_raw);
 
-        int32_t warp_m = blockIdx.y;
-        int32_t expert_idx = expert_idxs[warp_m];
-        if (BM*warp_m >= *num_tokens_post_padded) return;
+        int32_t block_base = blockIdx.y * BPC;
+        int32_t expert_idx = expert_idxs[block_base];
+        if (BM*block_base >= *num_tokens_post_padded) return;
         int32_t N2 = K;
         int32_t lane_id = threadIdx.x&31;
         bool is_prod = threadIdx.x < PRODUCER_THREADS;
@@ -325,20 +328,20 @@ namespace pi {
         }
         __syncthreads();
         if (threadIdx.x >= PRODUCER_THREADS && threadIdx.x < PRODUCER_THREADS+32)
-            tcgen05::tmem_alloc(&tmem_acc, 256);
+            tcgen05::tmem_alloc(&tmem_acc, ACC*BPC);
         __syncthreads();
-        if (threadIdx.x < BM) {
-            int32_t tdest = sorted_token_ids[warp_m*BM+threadIdx.x];
+        for (int32_t r = threadIdx.x; r < BM*BPC; r += blockDim.x) {
+            int32_t tdest = sorted_token_ids[block_base*BM+r];
             int32_t tok = -1;
             if (tdest >= 0) tok = tdest / top_k;
-            row_tok[threadIdx.x] = tok;
+            row_tok[r] = tok;
             if (tdest >= 0 && tok < M) {
-                uint32_t ptr = __cvta_generic_to_shared(topk_scales+threadIdx.x);
+                uint32_t ptr = __cvta_generic_to_shared(topk_scales+r);
                 cp_async::cg64<4>(ptr, topk_weights+tdest);
             }
         }
         __syncthreads();
-        auto con_sync = [=]() { asm volatile ("bar.sync 1, %0;\n" :: "n"(CONSUMER_THREADS)); };
+        auto con_sync = [=]() -> void { asm volatile ("bar.sync 1, %0;\n" :: "n"(CONSUMER_THREADS)); };
         int32_t n_stages_up = K / BLOCK_SHAPE_K;
         int32_t n_stages_down = N2 / BN2;
         int32_t phase = 0;
@@ -354,12 +357,14 @@ namespace pi {
                 }
                 int32_t offs = stage*BK;
                 bar_recycle[smem_stage].await(phase);
-                for (int32_t wave=0; wave < BM/ROWS_PER_WAVE; ++wave) {
-                    int32_t row_in_block = wave*ROWS_PER_WAVE+(threadIdx.x/CHUNKS_PER_ROW);
+                for (int32_t wave=0; wave < (BM*BPC)/ROWS_PER_WAVE; ++wave) {
+                    int32_t r = wave*ROWS_PER_WAVE+(threadIdx.x/CHUNKS_PER_ROW);
                     int32_t k8 = threadIdx.x&(CHUNKS_PER_ROW-1);
-                    int32_t tok = row_tok[row_in_block];
-                    if (row_in_block < BM && tok >= 0 && tok < M) {
-                        auto *dst = smem_up.x+smem_stage*XS+((k8*BM + row_in_block)<<3);
+                    int32_t b = r / BM;
+                    int32_t row_in_block = r - b*BM;
+                    int32_t tok = row_tok[r];
+                    if (r < BM*BPC && tok >= 0 && tok < M) {
+                        auto *dst = smem_up.x+smem_stage*XS*BPC+b*XS+((k8*BM + row_in_block)<<3);
                         const uint4 *src = reinterpret_cast<const uint4 *>(x+tok*K+offs+(k8<<3));
                         cp_async::cg256<TB>(static_cast<uint32_t>(__cvta_generic_to_shared(dst)), src);
                     }
@@ -378,7 +383,7 @@ namespace pi {
                 }
                 ++smem_stage;
             }
-            auto &smem_down = *reinterpret_cast<smem_down_pod<STAGES, WN, BM, BK, BN> *>(smem_raw);
+            auto &smem_down = *reinterpret_cast<smem_down_pod<STAGES, WN, BM, BK, BN, BPC> *>(smem_raw);
             for (int32_t stage = 0; stage < n_stages_down; ++stage) {
                 if (smem_stage == STAGES) {
                     phase^=1;
@@ -402,10 +407,14 @@ namespace pi {
         };
 
         const auto consumer = [&] {
-            int32_t tok_src = -1;
-            if (threadIdx.x >= PRODUCER_THREADS && threadIdx.x < PRODUCER_THREADS+BM) {
-                int32_t tdest = sorted_token_ids[warp_m*BM+(threadIdx.x - PRODUCER_THREADS)];
-                if (tdest >= 0) tok_src = tdest / top_k;
+            int32_t tok_src[BPC];
+            #pragma unroll
+            for (int32_t b = 0; b < BPC; ++b) {
+                tok_src[b] = -1;
+                if (threadIdx.x >= PRODUCER_THREADS && threadIdx.x < PRODUCER_THREADS+BM) {
+                    int32_t tdest = sorted_token_ids[(block_base+b)*BM+(threadIdx.x - PRODUCER_THREADS)];
+                    if (tdest >= 0) tok_src[b] = tdest / top_k;
+                }
             }
             for (int32_t i=0; i < STAGES; ++i) bar_recycle[i].arrive();
             uint32_t idesc = tcgen05::encode_idesc_format_1(BM, TC_N);
@@ -418,12 +427,15 @@ namespace pi {
                 bar_copy[smem_stage].await(phase);
                 if (warp_id == 0 && lane_id == 0) {
                     #pragma unroll
-                    for (int32_t k16=0; k16 < BK>>4; ++k16) {
-                        auto *__restrict__ a_ptr = smem_up.x+smem_stage*XS+((k16*BM)<<4);
-                        auto *__restrict__ b_ptr = smem_up.w+smem_stage*WS+((k16*TC_N)<<4);
-                        uint64_t a_desc = tcgen05::encode_smem_desc(a_ptr, BM);
-                        uint64_t b_desc = tcgen05::encode_smem_desc(b_ptr, TC_N);
-                        tcgen05::mma_f16(tmem_acc, a_desc, b_desc, idesc, stage||k16);
+                    for (int32_t b = 0; b < BPC; ++b) {
+                        #pragma unroll
+                        for (int32_t k16=0; k16 < BK>>4; ++k16) {
+                            auto *__restrict__ a_ptr = smem_up.x+smem_stage*XS*BPC+b*XS+((k16*BM)<<4);
+                            auto *__restrict__ b_ptr = smem_up.w+smem_stage*WS+((k16*TC_N)<<4);
+                            uint64_t a_desc = tcgen05::encode_smem_desc(a_ptr, BM);
+                            uint64_t b_desc = tcgen05::encode_smem_desc(b_ptr, TC_N);
+                            tcgen05::mma_f16(tmem_acc+b*ACC, a_desc, b_desc, idesc, stage||k16);
+                        }
                     }
                     tcgen05::commit_mbarrier(*bar_mma[smem_stage]);
                 }
@@ -433,20 +445,23 @@ namespace pi {
             }
             con_sync();
             tcgen05::after_thread_sync();
-            auto &smem_down = *reinterpret_cast<smem_down_pod<STAGES, WN, BM, BK, BN> *>(smem_raw);
+            auto &smem_down = *reinterpret_cast<smem_down_pod<STAGES, WN, BM, BK, BN, BPC> *>(smem_raw);
             if (warp_id < 4) {
                 int32_t row = (warp_id<<5)+lane_id;
                 #pragma unroll
-                for (int32_t c8=0; c8 < BK2>>3; ++c8) {
-                    float gate[8];
-                    float up[8];
-                    tcgen05::ld_32x32b_x8(gate, tcgen05::tmem_addr(tmem_acc, row, (c8<<3)));
-                    tcgen05::ld_32x32b_x8(up, tcgen05::tmem_addr(tmem_acc, row, BK2+(c8<<3)));
-                    tcgen05::await_ld();
-                    auto *dst = smem_down.x+((c8*BM+row)<<3);
+                for (int32_t b = 0; b < BPC; ++b) {
                     #pragma unroll
-                    for (int32_t e=0; e < 8; ++e)
-                        dst[e] = __float2bfloat16(swiglu(gate[e], up[e]));
+                    for (int32_t c8=0; c8 < BK2>>3; ++c8) {
+                        float gate[8];
+                        float up[8];
+                        tcgen05::ld_32x32b_x8(gate, tcgen05::tmem_addr(tmem_acc+b*ACC, row, (c8<<3)));
+                        tcgen05::ld_32x32b_x8(up, tcgen05::tmem_addr(tmem_acc+b*ACC, row, BK2+(c8<<3)));
+                        tcgen05::await_ld();
+                        auto *dst = smem_down.x+b*DXS+((c8*BM+row)<<3);
+                        #pragma unroll
+                        for (int32_t e=0; e < 8; ++e)
+                            dst[e] = __float2bfloat16(swiglu(gate[e], up[e]));
+                    }
                 }
             }
             con_sync();
@@ -458,63 +473,62 @@ namespace pi {
                 bar_copy[smem_stage].await(phase);
                 if (warp_id == 0 && lane_id == 0) {
                     #pragma unroll
-                    for (int32_t k16=0; k16 < BK2>>4; ++k16) {
-                        __nv_bfloat16 *a_ptr = smem_down.x+((k16*BM)<<4);
-                        __nv_bfloat16 *b_ptr = smem_down.w+smem_stage*WS+((k16*BN2)<<4);
-                        uint64_t a_desc = tcgen05::encode_smem_desc(a_ptr, BM);
-                        uint64_t b_desc = tcgen05::encode_smem_desc(b_ptr, BN2);
-                        tcgen05::mma_f16(
-                            tmem_acc,
-                            a_desc,
-                            b_desc,
-                            idesc,
-                            k16 != 0
-                        );
+                    for (int32_t b = 0; b < BPC; ++b) {
+                        #pragma unroll
+                        for (int32_t k16=0; k16 < BK2>>4; ++k16) {
+                            __nv_bfloat16 *a_ptr = smem_down.x+b*DXS+((k16*BM)<<4);
+                            __nv_bfloat16 *b_ptr = smem_down.w+smem_stage*WS+((k16*BN2)<<4);
+                            uint64_t a_desc = tcgen05::encode_smem_desc(a_ptr, BM);
+                            uint64_t b_desc = tcgen05::encode_smem_desc(b_ptr, BN2);
+                            tcgen05::mma_f16(tmem_acc+b*ACC, a_desc, b_desc, idesc, k16 != 0);
+                        }
                     }
                     tcgen05::commit_mbarrier(*bar_mma[smem_stage]);
                 }
                 bar_mma[smem_stage].await(phase);
                 bar_recycle[smem_stage].arrive();
-                asm volatile("cp.async.bulk.wait_group 0;\n");
-                cuda::ptx::fence_proxy_async(cuda::ptx::space_shared);
-                con_sync();
                 tcgen05::after_thread_sync();
-                if (warp_id < 4) {
-                    int32_t row = (warp_id<<5)+lane_id;
-                    float scale = topk_scales[row];
-                    #pragma unroll
-                    for (int32_t c8=0; c8 < BN2>>3; ++c8) {
-                        float vals[8];
-                        tcgen05::ld_32x32b_x8(vals, tcgen05::tmem_addr(tmem_acc, row, (c8<<3)));
-                        tcgen05::await_ld();
-                        __nv_bfloat16 *dst = smem_down.out+row*PAD+(c8<<3);
+                #pragma unroll
+                for (int32_t b=0; b < BPC; ++b) {
+                    asm volatile("cp.async.bulk.wait_group 0;\n");
+                    cuda::ptx::fence_proxy_async(cuda::ptx::space_shared);
+                    con_sync();
+                    if (warp_id < 4) {
+                        int32_t row = (warp_id<<5)+lane_id;
+                        float scale = topk_scales[b*BM+row];
                         #pragma unroll
-                        for (int32_t e=0; e < 8; ++e) {
-                            dst[e] = __float2bfloat16(scale*vals[e]);
+                        for (int32_t c8=0; c8 < BN2>>3; ++c8) {
+                            float vals[8];
+                            tcgen05::ld_32x32b_x8(vals, tcgen05::tmem_addr(tmem_acc+b*ACC, row, (c8<<3)));
+                            tcgen05::await_ld();
+                            __nv_bfloat16 *dst = smem_down.out+row*PAD+(c8<<3);
+                            #pragma unroll
+                            for (int32_t e=0; e < 8; ++e)
+                                dst[e] = __float2bfloat16(scale*vals[e]);
                         }
                     }
-                }
-                cuda::ptx::fence_proxy_async(cuda::ptx::space_shared);
-                con_sync();
-                if (threadIdx.x < PRODUCER_THREADS+BM) {
-                    if (tok_src >= 0 && tok_src < M) {
-                        cuda::ptx::cp_reduce_async_bulk(
-                            cuda::ptx::space_global,
-                            cuda::ptx::space_shared,
-                            cuda::ptx::op_add,
-                            out+tok_src*N2+stage*BN2,
-                            smem_down.out+PAD*(threadIdx.x - PRODUCER_THREADS),
-                            BN2*sizeof(__nv_bfloat16)
-                        );
+                    cuda::ptx::fence_proxy_async(cuda::ptx::space_shared);
+                    con_sync();
+                    if (threadIdx.x < PRODUCER_THREADS+BM) {
+                        if (tok_src[b] >= 0 && tok_src[b] < M) {
+                            cuda::ptx::cp_reduce_async_bulk(
+                                cuda::ptx::space_global,
+                                cuda::ptx::space_shared,
+                                cuda::ptx::op_add,
+                                out+tok_src[b]*N2+stage*BN2,
+                                smem_down.out+PAD*(threadIdx.x - PRODUCER_THREADS),
+                                BN2*sizeof(__nv_bfloat16)
+                            );
+                        }
+                        cuda::ptx::cp_async_bulk_commit_group();
                     }
-                    cuda::ptx::cp_async_bulk_commit_group();
                 }
                 ++smem_stage;
             }
             asm volatile("cp.async.bulk.wait_group 0;\n");
             con_sync();
             if (threadIdx.x >= PRODUCER_THREADS && threadIdx.x < PRODUCER_THREADS+32)
-                tcgen05::tmem_free(tmem_acc, 256);
+                tcgen05::tmem_free(tmem_acc, ACC*BPC);
         };
 
         if (is_prod) producer();
@@ -573,7 +587,7 @@ namespace pi {
         );
     }
 
-    template <const int32_t BM, const int32_t BN, const int32_t WN, const int32_t STAGES>
+    template <const int32_t BM, const int32_t BN, const int32_t WN, const int32_t STAGES, const int32_t BPC = 2>
     static void launch_fused_moe_kernel(
         const __nv_bfloat16 *x,
         const __nv_bfloat16 *w,
@@ -594,14 +608,14 @@ namespace pi {
     ) {
         static constexpr auto BK = 64;
         static constexpr auto PRODUCER_THREADS = 128;
-        static constexpr size_t SMEM = std::max(sizeof(smem_up_pod<STAGES, WN, BM, BK, BN>), sizeof(smem_down_pod<STAGES, WN, BM, BK, BN>));
+        static constexpr size_t SMEM = std::max(sizeof(smem_up_pod<STAGES, WN, BM, BK, BN, BPC>), sizeof(smem_down_pod<STAGES, WN, BM, BK, BN, BPC>));
         dim3 block = {(WN<<5)+PRODUCER_THREADS, 1, 1};
         dim3 grid = {
             static_cast<uint32_t>(std::ceil(static_cast<double>(N)/static_cast<double>(BN*WN))),
-            static_cast<uint32_t>(std::ceil(static_cast<double>(sorted_num)/static_cast<double>(block_m))),
+            static_cast<uint32_t>(std::ceil(static_cast<double>(sorted_num)/static_cast<double>(block_m*BPC))),
             1
         };
-        auto *kernel = fused_moe_kernel<BM, BK, BN, WN, STAGES, PRODUCER_THREADS>;
+        auto *kernel = fused_moe_kernel<BM, BK, BN, WN, STAGES, PRODUCER_THREADS, BPC>;
         if (cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM) != cudaSuccess)
             throw std::runtime_error {"Failed to set max dynamic shared memory size for fused_moe_kernel: "+std::to_string(SMEM)+" bytes"};
 
