@@ -408,8 +408,10 @@ namespace pi {
 
         const auto consumer = [&] {
             int32_t tok_src[BPC];
+            bool live[BPC];
             #pragma unroll
             for (int32_t b = 0; b < BPC; ++b) {
+                live[b] = row_tok[b*BM] >= 0;
                 tok_src[b] = -1;
                 if (threadIdx.x >= PRODUCER_THREADS && threadIdx.x < PRODUCER_THREADS+BM) {
                     int32_t tdest = sorted_token_ids[(block_base+b)*BM+(threadIdx.x - PRODUCER_THREADS)];
@@ -428,6 +430,7 @@ namespace pi {
                 if (warp_id == 0 && lane_id == 0) {
                     #pragma unroll
                     for (int32_t b = 0; b < BPC; ++b) {
+                        if (!live[b]) continue;
                         #pragma unroll
                         for (int32_t k16=0; k16 < BK>>4; ++k16) {
                             auto *__restrict__ a_ptr = smem_up.x+smem_stage*XS*BPC+b*XS+((k16*BM)<<4);
@@ -450,6 +453,7 @@ namespace pi {
                 int32_t row = (warp_id<<5)+lane_id;
                 #pragma unroll
                 for (int32_t b = 0; b < BPC; ++b) {
+                    if (!live[b]) continue;
                     #pragma unroll
                     for (int32_t c8=0; c8 < BK2>>3; ++c8) {
                         float gate[8];
@@ -474,6 +478,7 @@ namespace pi {
                 if (warp_id == 0 && lane_id == 0) {
                     #pragma unroll
                     for (int32_t b = 0; b < BPC; ++b) {
+                        if (!live[b]) continue;
                         #pragma unroll
                         for (int32_t k16=0; k16 < BK2>>4; ++k16) {
                             __nv_bfloat16 *a_ptr = smem_down.x+b*DXS+((k16*BM)<<4);
@@ -493,7 +498,7 @@ namespace pi {
                     asm volatile("cp.async.bulk.wait_group 0;\n");
                     cuda::ptx::fence_proxy_async(cuda::ptx::space_shared);
                     con_sync();
-                    if (warp_id < 4) {
+                    if (warp_id < 4 && live[b]) {
                         int32_t row = (warp_id<<5)+lane_id;
                         float scale = topk_scales[b*BM+row];
                         #pragma unroll
@@ -654,6 +659,7 @@ namespace pi {
     template <const int32_t BM, const int32_t BN, const int32_t WN>
     static void dispatch_stages(
         int32_t stages,
+        int32_t bpc,
         const __nv_bfloat16 *x,
         const __nv_bfloat16 *w,
         const __nv_bfloat16 *w2,
@@ -671,13 +677,16 @@ namespace pi {
         int32_t block_m,
         cudaStream_t stream
     ) {
-        switch (stages) {
-            case 1: launch_fused_moe_kernel<BM, BN, WN, 1>(x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream); break;
-            case 2: launch_fused_moe_kernel<BM, BN, WN, 2>(x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream); break;
-            case 3: launch_fused_moe_kernel<BM, BN, WN, 3>(x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream); break;
-            case 4: launch_fused_moe_kernel<BM, BN, WN, 4>(x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream); break;
-            case 5: launch_fused_moe_kernel<BM, BN, WN, 5>(x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream); break;
-            default: throw std::runtime_error {"Invalid number of stages: "+std::to_string(stages)};
+        switch (((bpc&0xf)<<4)|(stages&0xf)) {
+            case (1<<4)+1: launch_fused_moe_kernel<BM, BN, WN, 1, 1>(x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream); break;
+            case (1<<4)+2: launch_fused_moe_kernel<BM, BN, WN, 2, 1>(x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream); break;
+            case (1<<4)+3: launch_fused_moe_kernel<BM, BN, WN, 3, 1>(x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream); break;
+            case (1<<4)+4: launch_fused_moe_kernel<BM, BN, WN, 4, 1>(x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream); break;
+            case (1<<4)+5: launch_fused_moe_kernel<BM, BN, WN, 5, 1>(x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream); break;
+            case (2<<4)+1: launch_fused_moe_kernel<BM, BN, WN, 1, 2>(x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream); break;
+            case (2<<4)+2: launch_fused_moe_kernel<BM, BN, WN, 2, 2>(x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream); break;
+            case (2<<4)+3: launch_fused_moe_kernel<BM, BN, WN, 3, 2>(x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream); break;
+            default: throw std::runtime_error {"Invalid stages/bpc combination: "+std::to_string(stages)+"/"+std::to_string(bpc)};
         }
     }
 
@@ -686,6 +695,7 @@ namespace pi {
         int32_t bn,
         int32_t wn,
         int32_t stages,
+        int32_t bpc,
         const __nv_bfloat16 *x,
         const __nv_bfloat16 *w,
         const __nv_bfloat16 *w2,
@@ -704,10 +714,87 @@ namespace pi {
         cudaStream_t stream
     ) {
         switch (((bn&0xff)<<8)+(wn&0xff)) {
-            case (32<<8)+8: dispatch_stages<BM, 32, 8>(stages, x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream); break;
-            case (64<<8)+4: dispatch_stages<BM, 64, 4>(stages, x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream); break;
+            case (32<<8)+8: dispatch_stages<BM, 32, 8>(stages, bpc, x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream); break;
+            case (64<<8)+4: dispatch_stages<BM, 64, 4>(stages, bpc, x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream); break;
             default: throw std::runtime_error {"Invalid BN and WN: "+std::to_string(bn)+" and "+std::to_string(wn)};
         }
+    }
+
+    static __global__ void moe_align_kernel(
+        const int32_t *__restrict__ topk_ids,
+        int32_t *__restrict__ sorted_token_ids,
+        int32_t *__restrict__ expert_ids,
+        int32_t *__restrict__ num_tokens_post_padded,
+        int32_t n,
+        int32_t num_experts,
+        int32_t block_m,
+        int32_t pad_to,
+        int32_t max_padded,
+        int32_t max_blocks
+    ) {
+        extern __shared__ int32_t smem_align[];
+        auto *offs = smem_align;
+        auto *fill = smem_align+num_experts+1;
+        for (int32_t i=threadIdx.x; i <= num_experts; i += blockDim.x) {
+            offs[i] = 0;
+            if (i < num_experts) fill[i] = 0;
+        }
+        __syncthreads();
+        for (int32_t i=threadIdx.x; i < n; i += blockDim.x)
+            atomicAdd(offs+(topk_ids[i]+1), 1);
+        __syncthreads();
+        if (!threadIdx.x) {
+            for (int32_t e=0; e < num_experts; ++e) {
+                int32_t padded = (offs[e+1]+pad_to-1)/pad_to*pad_to;
+                offs[e+1] = offs[e]+padded;
+            }
+            *num_tokens_post_padded = offs[num_experts];
+        }
+        __syncthreads();
+        int32_t total = offs[num_experts];
+        for (int32_t i=threadIdx.x; i < max_padded; i += blockDim.x)
+            sorted_token_ids[i] = -1;
+        for (int32_t j=threadIdx.x; j < max_blocks; j += blockDim.x) {
+            int32_t row = j*block_m;
+            if (row >= total) {
+                expert_ids[j] = num_experts-1;
+                continue;
+            }
+            int32_t lo = 0, hi = num_experts-1;
+            while (lo < hi) {
+                int32_t mid = (lo+hi+1)>>1;
+                if (offs[mid] <= row) lo = mid;
+                else hi = mid-1;
+            }
+            expert_ids[j] = lo;
+        }
+        __syncthreads();
+        for (int32_t i=threadIdx.x; i < n; i += blockDim.x) {
+            int32_t e = topk_ids[i];
+            int32_t pos = atomicAdd(fill+e, 1);
+            sorted_token_ids[offs[e]+pos] = i;
+        }
+    }
+
+    void moe_align(
+        const int32_t *topk_ids,
+        int32_t *sorted_token_ids,
+        int32_t *expert_ids,
+        int32_t *num_tokens_post_padded,
+        int32_t n,
+        int32_t num_experts,
+        int32_t block_m,
+        int32_t pad_to,
+        int32_t max_padded,
+        int32_t max_blocks,
+        cudaStream_t stream
+    ) {
+        if (num_experts > 0x400)
+            throw std::runtime_error {"moe_align supports at most 1024 experts, got "+std::to_string(num_experts)};
+        moe_align_kernel<<<1, 0x400, ((num_experts<<1)+1)*sizeof(int32_t), stream>>>(
+            topk_ids, sorted_token_ids, expert_ids, num_tokens_post_padded,
+            n, num_experts, block_m, pad_to, max_padded, max_blocks
+        );
     }
 
     void fused_moe_bf16(
@@ -729,11 +816,12 @@ namespace pi {
         int32_t block_n,
         int32_t warp_n,
         int32_t stages,
+        int32_t bpc,
         cudaStream_t stream
     ) {
         switch (block_m) {
             case 128:
-                dispatch_bn_wn<128>(block_n, warp_n, stages, x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream);
+                dispatch_bn_wn<128>(block_n, warp_n, stages, bpc, x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream);
                 break;
             default:
                 throw std::runtime_error{
