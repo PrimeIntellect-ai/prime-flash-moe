@@ -469,6 +469,7 @@ namespace pi {
                 }
             }
             con_sync();
+            idesc = tcgen05::encode_idesc_format_1(BM, BN2);
             for (int32_t stage = 0; stage < n_stages_down; ++stage) {
                 if (smem_stage == STAGES) {
                     phase^=1;
