@@ -17,17 +17,17 @@ namespace pi {
         const int32_t *expert_idxs,
         const int32_t *num_tokens_post_padded,
         const float *topk_weights,
-        int32_t top_k,
-        int32_t M,
-        int32_t K,
-        int32_t N,
-        int32_t num_experts,
-        int32_t sorted_num,
-        int32_t block_m,
-        int32_t block_n,
-        int32_t warp_n,
-        int32_t stages,
-        int32_t bpc,
+        int top_k,
+        int M,
+        int K,
+        int N,
+        int num_experts,
+        int sorted_num,
+        int block_m,
+        int block_n,
+        int warp_n,
+        int stages,
+        int bpc,
         cudaStream_t stream
     );
 
@@ -43,17 +43,17 @@ namespace pi {
         const int32_t *expert_idxs,
         const int32_t *num_tokens_post_padded,
         const float *topk_weights,
-        int32_t top_k,
-        int32_t M,
-        int32_t K,
-        int32_t N,
-        int32_t num_experts,
-        int32_t sorted_num,
-        int32_t block_m,
-        int32_t block_n,
-        int32_t warp_n,
-        int32_t stages,
-        int32_t bpc,
+        int top_k,
+        int M,
+        int K,
+        int N,
+        int num_experts,
+        int sorted_num,
+        int block_m,
+        int block_n,
+        int warp_n,
+        int stages,
+        int bpc,
         cudaStream_t stream
     );
 
@@ -62,12 +62,12 @@ namespace pi {
         int32_t *sorted_token_ids,
         int32_t *expert_ids,
         int32_t *num_tokens_post_padded,
-        int32_t n,
-        int32_t num_experts,
-        int32_t block_m,
-        int32_t pad_to,
-        int32_t max_padded,
-        int32_t max_blocks,
+        int n,
+        int num_experts,
+        int block_m,
+        int pad_to,
+        int max_padded,
+        int max_blocks,
         cudaStream_t stream
     );
 
@@ -84,7 +84,7 @@ namespace pi {
         TORCH_CHECK(block_m > 0 && bpc > 0 && num_experts > 0);
         int64_t n = topk_ids.numel();
         int64_t pad_to = block_m*bpc;
-        int64_t max_padded = (n+num_experts*(pad_to-1)+pad_to-1)/pad_to*pad_to; // no bit tricks as pad can be a non power of 2 :()
+        int64_t max_padded = (n+num_experts*(pad_to-1)+pad_to-1) / pad_to*pad_to; // no bit tricks as pad can be a non power of 2 :()
         int64_t max_blocks = max_padded/block_m;
         auto opts = torch::TensorOptions().dtype(torch::kInt32).device(topk_ids.device());
         torch::Tensor sorted_token_ids = torch::empty({max_padded}, opts);
@@ -192,13 +192,22 @@ namespace pi {
     ) {
         cudaStream_t stream = at::cuda::getCurrentCUDAStream();
         at::cuda::OptionalCUDAGuard device_guard {device_of(x)};
-        TORCH_CHECK(x.size(0));
-        TORCH_CHECK(x.size(1) == w.size(2));
-        TORCH_CHECK((x.size(1)&127) == 0, "K dimension must be a multiple of 128");
+        const int64_t M = x.size(0);
+        const int64_t K = x.size(1);
+        const int64_t E = w.size(0);
+        const int64_t N = w.size(1);
+        TORCH_CHECK(M);
+        TORCH_CHECK(K == w.size(2));
+        TORCH_CHECK((K&255) == 0, "K dimension must be a multiple of 256 on the mxfp8 path");
+        TORCH_CHECK((N&255) == 0, "N dimension must be a multiple of 256 on the mxfp8 path");
+        TORCH_CHECK(w2.size(0) == E && w2.size(1) == K && w2.size(2) == N/2);
         TORCH_CHECK((block_n == 64 && warp_n == 4) || (block_n == 32 && warp_n == 8));
-        TORCH_CHECK(stages > 0 && stages < 6);
-        TORCH_CHECK(bpc == 1 || bpc == 2);
+        TORCH_CHECK(stages > 0 && stages < 5, "mxfp8 supports stages in 1..4");
+        TORCH_CHECK(bpc == 1, "mxfp8 supports bpc=1 only: tensor memory has no room for a second accumulator plus scale factors");
         TORCH_CHECK(block_m == 128, "Blackwell tcgen05 fused MoE requires block_m=128.");
+        TORCH_CHECK(x_scales.numel() == M*(K/32), "x_scales must be a row major (M, K/32) e8m0 tensor");
+        TORCH_CHECK(w_scales.numel() == E*N*(K/32), "w_scales must hold E*N*K/32 e8m0 values in the blocked layout");
+        TORCH_CHECK(w2_scales.numel() == E*K*((N/2)/32), "w2_scales must hold E*K*(N/2)/32 e8m0 values in the blocked layout");
         TORCH_CHECK(x.is_contiguous());
         TORCH_CHECK(x_scales.is_contiguous());
         TORCH_CHECK(w.is_contiguous());
@@ -221,12 +230,7 @@ namespace pi {
         TORCH_CHECK(expert_ids.dtype() == torch::kInt32);
         TORCH_CHECK(num_tokens_post_padded.dtype() == torch::kInt32);
         TORCH_CHECK(out.dtype() == torch::kBFloat16);
-        TORCH_CHECK(topk_weights.dtype() == torch::kFloat32);
-        TORCH_CHECK(sorted_token_ids.dtype() == torch::kInt32);
-        TORCH_CHECK(expert_ids.dtype() == torch::kInt32);
-        TORCH_CHECK(num_tokens_post_padded.dtype() == torch::kInt32);
-        TORCH_CHECK(out.dtype() == torch::kBFloat16);
-        fused_moe_bf16(
+        fused_moe_mxfp8(
             static_cast<const __nv_fp8_e4m3 *>(x.const_data_ptr()),
             static_cast<const __nv_fp8_e8m0 *>(x_scales.const_data_ptr()),
             static_cast<const __nv_fp8_e4m3 *>(w.const_data_ptr()),
@@ -239,10 +243,10 @@ namespace pi {
             static_cast<const int32_t *>(num_tokens_post_padded.const_data_ptr()),
             static_cast<const float *>(topk_weights.const_data_ptr()),
             top_k,
-            x.size(0),
-            x.size(1),
-            w.size(1),
-            w.size(0),
+            M,
+            K,
+            N,
+            E,
             sorted_token_ids.size(0),
             block_m,
             block_n,

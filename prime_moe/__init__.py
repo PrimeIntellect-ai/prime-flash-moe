@@ -1,5 +1,6 @@
 import torch
 from . import _C
+from .mxfp8 import quantize_activation_mxfp8, quantize_weight_mxfp8, pack_scales_blocked
 
 
 @torch.library.register_fake('prime_moe::fused_moe_bf16')
@@ -17,6 +18,7 @@ def fused_moe_bf16_abstract(
     block_n: int,
     warp_n: int,
     stages: int,
+    bpc: int,
 ) -> torch.Tensor:
     return out
 
@@ -35,9 +37,10 @@ def fused_moe_bf16(
     block_n: int,
     warp_n: int,
     stages: int,
+    bpc: int = 1,
 ) -> torch.Tensor:
     return torch.ops.prime_moe.fused_moe_bf16(
-        x, w, w2, sorted_token_ids, expert_ids, num_tokens_post_padded, topk_weights, out, top_k, block_m, block_n, warp_n, stages
+        x, w, w2, sorted_token_ids, expert_ids, num_tokens_post_padded, topk_weights, out, top_k, block_m, block_n, warp_n, stages, bpc
     )
 
 @torch.library.register_fake('prime_moe::fused_moe_mxfp8')
@@ -58,6 +61,7 @@ def fused_moe_mxfp8_abstract(
     block_n: int,
     warp_n: int,
     stages: int,
+    bpc: int,
 ) -> torch.Tensor:
     return out
 
@@ -79,9 +83,15 @@ def fused_moe_mxfp8(
     block_n: int,
     warp_n: int,
     stages: int,
-) -> torch.Tensor:
-    return torch.ops.prime_moe.fused_moe_mxfp8(
-        x, x_scales, w, w_scales, w2, w2_scales, sorted_token_ids, expert_ids, num_tokens_post_padded, topk_weights, out, top_k, block_m, block_n, warp_n, stages
+    bpc: int = 1,
+) -> torch.Tensor:ch.ops.prime_moe.fused_moe_mxfp8(
+        x, x_scales, w, w_scales, w2, w2_scales, sorted_token_ids, expert_ids, num_tokens_post_padded, topk_weights, out, top_k, block_m, block_n, warp_n, stages, bpc
     )
 
-__all__ = ['fused_moe_bf16', 'fused_moe_mxfp8']
+__all__ = [
+    'fused_moe_bf16',
+    'fused_moe_mxfp8',
+    'quantize_activation_mxfp8',
+    'quantize_weight_mxfp8',
+    'pack_scales_blocked',
+]
