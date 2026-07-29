@@ -117,12 +117,14 @@ namespace pi {
                 bar_copy[smem_stage].arrive_cp_async_mem();
                 if (!threadIdx.x) {
                     bar_copy[smem_stage].expect_nb(WS*sizeof(__nv_bfloat16));
-                    cp_async::load3d(
+                    cp_async::load5d(
                         smem_up.w+smem_stage*WS,
                         &map_w,
                         *bar_copy[smem_stage],
                         0,
-                        expert_idx*N+blockIdx.x*(WN*BN),
+                        0,
+                        expert_idx<<1,
+                        blockIdx.x*((WN*BN)>>8),
                         offs>>3
                     );
                 }
@@ -318,10 +320,11 @@ namespace pi {
         if (cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM) != cudaSuccess)
             throw std::runtime_error {"Failed to set max dynamic shared memory size for fused_moe_kernel: "+std::to_string(SMEM)+" bytes"};
 
-        CUtensorMap map_w = init_tmap_kmajor_3d(
+        CUtensorMap map_w = init_tmap_swiglu_kmajor_5d_bf16(
             "w",
             w,
-            static_cast<uint64_t>(N*num_experts),
+            static_cast<uint64_t>(num_experts),
+            static_cast<uint64_t>(N),
             static_cast<uint64_t>(K),
             BN*WN,
             BK

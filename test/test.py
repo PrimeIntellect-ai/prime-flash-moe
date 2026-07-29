@@ -137,20 +137,6 @@ for bn, wn in [(32, 8)]:
         configs.append((block_m, bn, wn, stages))
 
 
-def pack_w1_for_kernel(w1):
-    E, N, K = w1.shape
-    assert (N&255) == 0
-    H = N>>1
-    assert (H&127) == 0
-    gate = w1[:, :H, :]
-    up = w1[:, H:, :]
-    chunks = []
-    for i in range(0, H, 128):
-        chunks.append(gate[:, i : i+128, :])
-        chunks.append(up[:, i : i+128, :])
-    return torch.cat(chunks, dim=1).contiguous()
-
-
 def test_cfg(num_tokens, K, E, N, top_k, block_m, bn, wn, stages):
     x = torch.empty((num_tokens, K), dtype=torch.bfloat16, device='cuda:0').normal_(mean=0, std=0.05)
     w1 = torch.randn((E, N, K), dtype=torch.bfloat16, device='cuda:0')
@@ -161,7 +147,7 @@ def test_cfg(num_tokens, K, E, N, top_k, block_m, bn, wn, stages):
     out = torch.zeros_like(x, dtype=torch.bfloat16, device='cuda:0')
     sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size_simple(topk_ids, block_m, E)
     torch.ops.prime_moe.fused_moe_bf16(
-        x, pack_w1_for_kernel(w1), w2, sorted_token_ids, expert_ids, num_tokens_post_padded, topk_weights, out, top_k, block_m, bn, wn, stages
+        x, w1, w2, sorted_token_ids, expert_ids, num_tokens_post_padded, topk_weights, out, top_k, block_m, bn, wn, stages, 1
     )
     torch.cuda.synchronize()
     out_naive = moe_naive_from_topk(x, w1, w2, topk_ids, topk_weights)
