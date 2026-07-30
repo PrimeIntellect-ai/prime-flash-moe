@@ -1,5 +1,13 @@
+import os
+import sys
+
 import prime_moe
 import torch
+
+# Accuracy gates for the bf16 path against the _grouped_mm reference. Initial estimates --
+# calibrate against the observed numbers on the first real run, then tighten.
+REL_CLAMP_10_MAX = float(os.environ.get('PRIME_MOE_REL_CLAMP_10', 0.02))
+REL_CLAMP_1_MAX = float(os.environ.get('PRIME_MOE_REL_CLAMP_1', 0.10))
 
 
 def moe_naive_from_topk(x, w1, w2, topk_ids, topk_weights):
@@ -137,20 +145,6 @@ for bn, wn in [(32, 8)]:
         configs.append((block_m, bn, wn, stages))
 
 
-def pack_w1_for_kernel(w1):
-    E, N, K = w1.shape
-    assert (N&255) == 0
-    H = N>>1
-    assert (H&127) == 0
-    gate = w1[:, :H, :]
-    up = w1[:, H:, :]
-    chunks = []
-    for i in range(0, H, 128):
-        chunks.append(gate[:, i : i+128, :])
-        chunks.append(up[:, i : i+128, :])
-    return torch.cat(chunks, dim=1).contiguous()
-
-
 def test_cfg(num_tokens, K, E, N, top_k, block_m, bn, wn, stages):
     x = torch.empty((num_tokens, K), dtype=torch.bfloat16, device='cuda:0').normal_(mean=0, std=0.05)
     w1 = torch.randn((E, N, K), dtype=torch.bfloat16, device='cuda:0')
@@ -161,25 +155,54 @@ def test_cfg(num_tokens, K, E, N, top_k, block_m, bn, wn, stages):
     out = torch.zeros_like(x, dtype=torch.bfloat16, device='cuda:0')
     sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size_simple(topk_ids, block_m, E)
     torch.ops.prime_moe.fused_moe_bf16(
-        x, pack_w1_for_kernel(w1), w2, sorted_token_ids, expert_ids, num_tokens_post_padded, topk_weights, out, top_k, block_m, bn, wn, stages
+        x, w1, w2, sorted_token_ids, expert_ids, num_tokens_post_padded, topk_weights, out, top_k, block_m, bn, wn, stages, 1
     )
     torch.cuda.synchronize()
     out_naive = moe_naive_from_topk(x, w1, w2, topk_ids, topk_weights)
     torch.cuda.synchronize()
-    print('finite fused:', torch.isfinite(out.float()).all().item())
-    print('finite naive:', torch.isfinite(out_naive.float()).all().item())
     diff = (out.float() - out_naive.float()).abs()
     ref = out_naive.float().abs()
-    print('max_abs', diff.max().item())
-    print('mean_abs', diff.mean().item())
-    print('p99_abs', torch.quantile(diff.flatten(), 0.99).item())
-    print('rel_clamp_1', (diff / ref.clamp_min(1.0)).max().item())
-    print('rel_clamp_10', (diff / ref.clamp_min(10.0)).max().item())
+    fused_finite = torch.isfinite(out.float()).all().item()
+    naive_finite = torch.isfinite(out_naive.float()).all().item()
+    rel_1 = (diff / ref.clamp_min(1.0)).max().item()
+    rel_10 = (diff / ref.clamp_min(10.0)).max().item()
+
+    cfg = f'T={num_tokens} K={K} E={E} N={N} bn={bn} wn={wn} stages={stages}'
+    print(cfg)
+    print('  finite fused/naive:', fused_finite, naive_finite)
+    print('  max_abs', diff.max().item(), 'mean_abs', diff.mean().item())
+    print('  p99_abs', torch.quantile(diff.flatten(), 0.99).item())
+    print('  rel_clamp_1', rel_1)
+    print('  rel_clamp_10', rel_10)
+
+    failures = []
+    if not fused_finite:
+        failures.append('fused output has non finite values')
+    if not naive_finite:
+        failures.append('reference output has non finite values')
+    if rel_10 > REL_CLAMP_10_MAX:
+        failures.append(f'rel_clamp_10 {rel_10:.4g} > {REL_CLAMP_10_MAX:.4g}')
+    if rel_1 > REL_CLAMP_1_MAX:
+        failures.append(f'rel_clamp_1 {rel_1:.4g} > {REL_CLAMP_1_MAX:.4g}')
+    if failures:
+        print('  FAIL:', '; '.join(failures))
+    return [f'{cfg}: {f}' for f in failures]
 
 
+failures, ncfg, nbad = [], 0, 0
 for E in e_vals:
     for N in n_vals:
         for K in k_vals:
             for num_tokens in batch_sizes:
                 for block_m, bn, wn, stages in configs:
-                    test_cfg(num_tokens, K, E, N, top_k, block_m, bn, wn, stages)
+                    f = test_cfg(num_tokens, K, E, N, top_k, block_m, bn, wn, stages)
+                    failures += f
+                    ncfg += 1
+                    nbad += bool(f)
+
+print(f'\n{ncfg - nbad}/{ncfg} configs passed')
+if failures:
+    print(f'{len(failures)} failure(s):')
+    for msg in failures:
+        print('  -', msg)
+    sys.exit(1)

@@ -175,7 +175,9 @@ namespace pi {
                 for (int i=threadIdx.x; i < SFW_CHUNKS; i += PRODUCER_THREADS) {
                     int j = i/(SFT>>3);
                     int o = (i-j*(SFT>>3))<<3;
-                    int64_t tile = (static_cast<int64_t>(expert_idx)*(N>>7)+blockIdx.x*NSFW+j)*(K>>7)+stage;
+                    int32_t pb = blockIdx.x*NSFW+j;
+                    int32_t sb = (1&pb)*(N>>8)+(pb>>1);
+                    int64_t tile = (static_cast<int64_t>(expert_idx)*(N>>7)+sb)*(K>>7)+stage;
                     cp_async::cg64<8>(
                         static_cast<uint32_t>(__cvta_generic_to_shared(smem_up.sfw+smem_stage*NSFW*SFT+j*SFT+o)),
                         w_scales+tile*SFT+o
@@ -184,12 +186,14 @@ namespace pi {
                 bar_copy[smem_stage].arrive_cp_async_mem();
                 if (!threadIdx.x) {
                     bar_copy[smem_stage].expect_nb(WS*sizeof(__nv_fp8_e4m3));
-                    cp_async::load3d(
+                    cp_async::load5d(
                         smem_up.w+smem_stage*WS,
                         &map_w,
                         *bar_copy[smem_stage],
                         0,
-                        expert_idx*N+blockIdx.x*TC_N,
+                        0,
+                        expert_idx<<1,
+                        blockIdx.x*(TC_N>>8),
                         offs>>4
                     );
                 }
@@ -435,10 +439,11 @@ namespace pi {
         if (cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM) != cudaSuccess)
             throw std::runtime_error {"Failed to set max dynamic shared memory size for fused_moe_mxfp8_kernel: "+std::to_string(SMEM)+" bytes"};
 
-        CUtensorMap map_w = init_tmap_kmajor_3d_fp8(
+        CUtensorMap map_w = init_tmap_swiglu_kmajor_5d_fp8(
             "w",
             w,
-            static_cast<uint64_t>(N)*static_cast<uint64_t>(num_experts),
+            static_cast<uint64_t>(num_experts),
+            static_cast<uint64_t>(N),
             static_cast<uint64_t>(K),
             BN*WN,
             BK

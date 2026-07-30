@@ -54,17 +54,17 @@ namespace pi {
         }
 
         [[nodiscard]] constexpr __device__ __forceinline__ uint32_t encode_idesc_format_1(int32_t m, int32_t n) {
-            constexpr uint32_t sparsity_sel = 0; // ignored
+            constexpr uint32_t sparsity_sel = 0;  // ignored
             constexpr uint32_t sparsity_mode = 0; // 0=dense,1=sparse
-            constexpr uint32_t sat_mode = 0; // 0=no sat, 1=sat
-            constexpr uint32_t mtype = 1u; // 1=f32
-            constexpr uint32_t atype = 1u; // 1=bf16
-            constexpr uint32_t btype = 1u; // 1=bf16
-            constexpr uint32_t aᵀ = 0u; // 1 = Aᵀ
-            constexpr uint32_t bᵀ = 0u; // 1 = Bᵀ
-            constexpr uint32_t an = 0u; // 1 = -A
-            constexpr uint32_t bn = 0u; // 1 = -B
-            constexpr uint32_t bws_shift = 0u; // no shift = 0 maximum shift of 8 = 1 maximum shift of 16 = 2 maximum shift of 32 = 3
+            constexpr uint32_t sat_mode = 0;      // 0=no sat, 1=sat
+            constexpr uint32_t mtype = 1;         // 1=f32
+            constexpr uint32_t atype = 1;         // 1=bf16
+            constexpr uint32_t btype = 1;         // 1=bf16
+            constexpr uint32_t aᵀ = 0;            // 1 = Aᵀ
+            constexpr uint32_t bᵀ = 0;            // 1 = Bᵀ
+            constexpr uint32_t an = 0;            // 1 = -A
+            constexpr uint32_t bn = 0;            // 1 = -B
+            constexpr uint32_t bws_shift = 0;     // no shift = 0 maximum shift of 8 = 1 maximum shift of 16 = 2 maximum shift of 32 = 3
             return
                 (sparsity_sel & 3)
                 | ((sparsity_mode & 1)<<2)
@@ -81,23 +81,19 @@ namespace pi {
                 | ((bws_shift & 3)<<30);
         }
 
-        // Instruction descriptor "format 2", used by the block scaled MMA kinds
-        // (.kind::mxf8f6f4 / .kind::mxf4 / .kind::mxf4nvf4). Note that unlike format 1
-        // there is no accumulator-type field (it is always f32) and no saturate field:
-        // bits [4,6) and [29,31) hold the scale factor selectors for B and A instead.
         [[nodiscard]] constexpr __device__ __forceinline__ uint32_t encode_idesc_block_scaled_e4m3(int32_t m, int32_t n) {
             constexpr uint32_t sparsity_sel = 0;  // ignored
             constexpr uint32_t sparsity_mode = 0; // 0=dense, 1=sparse
             constexpr uint32_t a_sf_id = 0;       // patched per MMA, see idesc_with_sf_id
             constexpr uint32_t b_sf_id = 0;       // patched per MMA, see idesc_with_sf_id
-            constexpr uint32_t atype = 0u;        // mxf8f6f4: 0=e4m3, 1=e5m2, 3=e2m3, 4=e3m2, 5=e2m1
-            constexpr uint32_t btype = 0u;
-            constexpr uint32_t aᵀ = 0u;           // 1 = Aᵀ (MN-major)
-            constexpr uint32_t bᵀ = 0u;           // 1 = Bᵀ (MN-major)
-            constexpr uint32_t an = 0u;           // 1 = -A
-            constexpr uint32_t bn = 0u;           // 1 = -B
-            constexpr uint32_t scale_fmt = 1u;    // 0=e4m3, 1=e8m0
-            constexpr uint32_t k_size = 0u;       // mxf8f6f4 dense: MMA-K = 32
+            constexpr uint32_t atype = 0;         // mxf8f6f4: 0=e4m3, 1=e5m2, 3=e2m3, 4=e3m2, 5=e2m1
+            constexpr uint32_t btype = 0;
+            constexpr uint32_t aᵀ = 0;            // 1 = Aᵀ (MN-major)
+            constexpr uint32_t bᵀ = 0;            // 1 = Bᵀ (MN-major)
+            constexpr uint32_t an = 0;            // 1 = -A
+            constexpr uint32_t bn = 0;            // 1 = -B
+            constexpr uint32_t scale_fmt = 1;     // 0=e4m3, 1=e8m0
+            constexpr uint32_t k_size = 0;        // mxf8f6f4 dense: MMA-K = 32
             return
                 (sparsity_sel & 3)
                 | ((sparsity_mode & 1)<<2)
@@ -261,6 +257,26 @@ namespace pi {
             );
         }
 
+        __device__ __forceinline__ void load5d(
+            void *dst,
+            const void *tma_map,
+            uint64_t *bar,
+            int32_t c0,
+            int32_t c1,
+            int32_t c2,
+            int32_t c3,
+            int32_t c4
+        ) {
+            asm volatile(
+                "cp.async.bulk.tensor.5d.shared::cta.global.tile.mbarrier::complete_tx::bytes "
+                "[%0], [%1, {%3, %4, %5, %6, %7}], [%2];\n"
+                :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(dst))),
+                    "l"(reinterpret_cast<uint64_t>(tma_map)),
+                    "r"(static_cast<uint32_t>(__cvta_generic_to_shared(bar))),
+                    "r"(c0), "r"(c1), "r"(c2), "r"(c3), "r"(c4) : "memory"
+            );
+        }
+
         template <const int32_t nb, typename Dst, typename Src>
         __device__ __forceinline__ void cg256(Dst dst, Src src) {
             asm volatile("cp.async.cg.shared.global.L2::256B [%0], [%1], %2;\n" :: "r"(dst), "l"(src), "n"(nb));
@@ -408,6 +424,72 @@ namespace pi {
             {16u, tile_height, tile_width>>4},
             {1u, 1u, 1u},
             CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE
+        );
+    }
+
+    [[nodiscard]] inline CUtensorMap init_tmap_swiglu_kmajor_5d(
+        const char *name,
+        CUtensorMapDataType dtype,
+        uint64_t elem_size,
+        const void *ptr,
+        uint64_t num_experts,
+        uint64_t global_height,    // N == 2H, rows per expert
+        uint64_t global_width,     // K
+        uint32_t tile_height,      // rows of the packed tile, must be a multiple of 256
+        uint32_t tile_width        // BK
+    ) {
+        const uint64_t vec = 16/elem_size;                   // elements per 16B inner atom
+        if ((global_width%vec) || (tile_width%vec))
+            throw std::runtime_error{std::string{name}+": K-like dim must be a multiple of "+std::to_string(vec)};
+        if (255&global_height)
+            throw std::runtime_error{std::string{name}+": N must be a multiple of 256 to interleave gate/up"};
+        if (255&tile_height)
+            throw std::runtime_error{std::string{name}+": tile height must be a multiple of 256 to interleave gate/up"};
+        const uint64_t half = global_height>>1;              // H
+        const uint64_t row = global_width*elem_size;         // bytes per weight row
+        return init_tmap<5>(
+            name,
+            dtype,
+            ptr,
+            {vec, 128ull, num_experts<<1, half>>7, global_width/vec},
+            {row, half*row, 128ull*row, 16ull},
+            {static_cast<uint32_t>(vec), 128u, 2u, tile_height>>8, static_cast<uint32_t>(tile_width/vec)},
+            {1u, 1u, 1u, 1u, 1u},
+            CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE
+        );
+    }
+
+    [[nodiscard]] inline CUtensorMap init_tmap_swiglu_kmajor_5d_bf16(
+        const char *name,
+        const void *ptr,
+        uint64_t num_experts,
+        uint64_t global_height,
+        uint64_t global_width,
+        uint32_t tile_height,
+        uint32_t tile_width
+    ) {
+        return init_tmap_swiglu_kmajor_5d(
+            name,
+            CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+            sizeof(__nv_bfloat16),
+            ptr, num_experts, global_height, global_width, tile_height, tile_width
+        );
+    }
+
+    [[nodiscard]] inline CUtensorMap init_tmap_swiglu_kmajor_5d_fp8(
+        const char *name,
+        const void *ptr,
+        uint64_t num_experts,
+        uint64_t global_height,
+        uint64_t global_width,
+        uint32_t tile_height,
+        uint32_t tile_width
+    ) {
+        return init_tmap_swiglu_kmajor_5d(
+            name,
+            CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8,
+            sizeof(uint8_t),
+            ptr, num_experts, global_height, global_width, tile_height, tile_width
         );
     }
 }
