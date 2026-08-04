@@ -1,21 +1,31 @@
-"""Benchmark the fused MoE kernels against a naive torch expert loop.
+"""Benchmark the fused MoE kernels against torch's grouped GEMM path.
 
-The torch baseline is deliberately reduced to the arithmetic only:
+The baseline is the realistic "no fused kernel" option: a single grouped GEMM call per
+projection (``torch.nn.functional.grouped_mm`` for bf16, ``scaled_grouped_mm`` for mxfp8),
+not a per-expert python loop. That is what you would actually reach for without a custom
+kernel, so it is the fair ruler for "is the fused kernel worth it":
 
-    gate_up = x @ w1[expert].T
+    gate_up = grouped_mm(x, w1, offs)         # one launch across every expert
     gate, up = gate_up.chunk(2, dim=-1)
     act = F.silu(gate) * up
-    expert_out = act @ w2[expert].T
+    expert_out = grouped_mm(act, w2, offs)    # one launch across every expert
     out = routing_weight * expert_out
 
-Routing, sorting, the per expert gather and the final scatter all happen once during
-setup and sit outside the timed region, so the baseline is not charged for bookkeeping
-that the fused kernel folds into its prologue. Both sides are timed with CUDA graph
+Routing, sorting, the gather and the final scatter all happen once during setup and sit
+outside the timed region for both sides, so neither implementation is charged for
+bookkeeping that isn't part of its own kernel. Both sides are timed with CUDA graph
 replays by default so the numbers are GPU time, not python dispatch time.
 
-Two dtypes are reported. bf16 compares against ``x @ w.T``; mxfp8 compares against
-``torch.nn.functional.scaled_mm`` with OCP MX (1x32 e8m0) block scales on both operands,
-and the baseline requantizes the intermediate activation exactly like the kernel does.
+Two dtypes are reported. bf16 compares against ``torch.nn.functional.grouped_mm``; mxfp8
+compares against ``torch.nn.functional.scaled_grouped_mm`` with OCP MX (1x32 e8m0) block
+scales on both operands, and the baseline requantizes the intermediate activation exactly
+like the kernel does. mxfp8 groups must start on a 128 row boundary (the MX swizzle tile),
+so each expert's slice of the grouped call is padded up to a multiple of 128 rows; bf16
+has no such constraint and runs on the raw, unpadded per-expert counts.
+
+Run it as-is on any CUDA box with prime_moe installed to get both plots for your machine:
+
+    python benchmark/benchmark.py
 """
 
 import argparse
@@ -57,6 +67,7 @@ except Exception as exc:  # the extension may not be built for this box
 
 
 BLOCK = 32
+MX_ALIGN = 128  # scaled_grouped_mm groups must start on a swizzle tile boundary
 E4M3_MAX = 448.0
 E4M3_EMAX = 8  # 448 == 1.75 * 2**8
 MX = ScalingType.BlockWise1x32
@@ -99,11 +110,6 @@ def dequantize_mx(q: torch.Tensor, scales: torch.Tensor, block: int = BLOCK) -> 
     return g.reshape(*q.shape[:-1], k)
 
 
-def mx_mm(a: torch.Tensor, a_sf: torch.Tensor, bt: torch.Tensor, bt_sf: torch.Tensor) -> torch.Tensor:
-    """``a @ bt.T`` in mxfp8. Both scale tensors are already in the swizzled blocked layout."""
-    return scaled_mm(a, bt.t(), a_sf, MX, bt_sf, MX, swizzle_a=SWZ, swizzle_b=SWZ, output_dtype=torch.bfloat16)
-
-
 # ---------------------------------------------------------------- routing
 
 
@@ -115,8 +121,14 @@ def generate_topk_ids(num_experts: int, num_tokens: int, top_k: int, balancednes
     return torch.multinomial(probs, num_tokens * top_k, replacement=True).view(num_tokens, top_k).to(torch.int32)
 
 
-def make_routing(topk_ids: torch.Tensor, block_m: int, num_experts: int) -> dict:
-    """Sort the (token, slot) pairs by expert and build the kernel's block schedule."""
+def make_routing(topk_ids: torch.Tensor, block_m: int, num_experts: int, bpc: int = 1) -> dict:
+    """Sort the (token, slot) pairs by expert and build the kernel's block schedule.
+
+    Padded to a multiple of ``block_m * bpc`` per expert, matching ``torch.ops.prime_moe.moe_align``.
+    With bpc>1 a CTA covers ``bpc`` consecutive blocks under one ``expert_idx`` lookup; padding to
+    only ``block_m`` lets an expert's last (odd) block pair up with the next expert's first block
+    in the same CTA, silently computing that half with the wrong expert's weights.
+    """
     T, top_k = topk_ids.shape
     pair_ids = torch.arange(T * top_k, device='cuda', dtype=torch.int32)
     expert_flat = topk_ids.reshape(-1).to(torch.int32)
@@ -124,7 +136,8 @@ def make_routing(topk_ids: torch.Tensor, block_m: int, num_experts: int) -> dict
     expert_sorted = expert_flat[sort_idx]
     pair_sorted = pair_ids[sort_idx]
     counts = torch.bincount(expert_sorted, minlength=num_experts).to(torch.int32)
-    padded_counts = ((counts + block_m - 1) // block_m) * block_m
+    pad_to = block_m * bpc
+    padded_counts = ((counts + pad_to - 1) // pad_to) * pad_to
     counts_cpu = counts.tolist()
     padded_cpu = padded_counts.tolist()
     total_padded = sum(padded_cpu)
@@ -153,70 +166,87 @@ def make_routing(topk_ids: torch.Tensor, block_m: int, num_experts: int) -> dict
     }
 
 
-def gather_per_expert(x: torch.Tensor, topk_weights: torch.Tensor, routing: dict, top_k: int, pad_to: int) -> dict:
-    """Split the sorted pairs into one dense tensor per expert, padded up to ``pad_to`` rows.
+def build_grouped_bf16_inputs(x: torch.Tensor, topk_weights: torch.Tensor, routing: dict, top_k: int) -> dict:
+    """Flatten the sorted (token, slot) pairs into one contiguous gather, no per-expert padding.
 
-    This is the work the fused kernel does inline and the baseline is not charged for.
-    Padding rows are zero, so they contribute nothing but keep every expert tile a legal
-    shape for the mxfp8 scale layout (which needs a multiple of 128 rows).
+    bf16 ``grouped_mm`` accepts ragged group sizes directly, so this is exactly what a real
+    caller without a fused kernel would do: one gather, one offsets tensor, no expert loop.
     """
     pair_sorted = routing['pair_sorted']
-    tok_all = (pair_sorted // top_k).long()
-    route_all = (pair_sorted % top_k).long()
-    xs, ws, toks, rows = [], [], [], []
-    off = 0
-    for c in routing['counts']:
-        tok = tok_all[off : off + c]
-        route = route_all[off : off + c]
-        padded = (c + pad_to - 1) // pad_to * pad_to
-        xe = x.new_zeros((padded, x.shape[1]))
-        xe[:c] = x[tok]
-        we = torch.zeros((padded, 1), device=x.device, dtype=torch.bfloat16)
-        we[:c, 0] = topk_weights[tok, route].to(torch.bfloat16)
-        xs.append(xe)
-        ws.append(we)
-        toks.append(tok)
-        rows.append(c)
-        off += c
-    return {'x': xs, 'w': ws, 'tok': toks, 'rows': rows}
+    tok = (pair_sorted // top_k).long()
+    route = pair_sorted % top_k
+    offs = torch.cumsum(torch.tensor(routing['counts'], device='cuda', dtype=torch.int32), dim=0).to(torch.int32)
+    return {
+        'xg': x[tok],
+        'wg': topk_weights[tok, route.long()].to(torch.bfloat16),
+        'offs': offs,
+        'tok': tok,
+    }
+
+
+def build_grouped_mxfp8_inputs(x: torch.Tensor, topk_weights: torch.Tensor, routing: dict, top_k: int) -> dict:
+    """Same idea as the bf16 gather, but each expert's slice is padded to a multiple of 128 rows.
+
+    ``scaled_grouped_mm`` swizzles MX block scales in 128 row tiles; a group boundary that
+    doesn't land on a tile boundary would mix scale factors across experts. Padding rows are
+    real (safe, clamped) gathers so quantization never sees garbage; they're masked out again
+    whenever the result is actually used for correctness (never during timing).
+    """
+    pair_sorted = routing['pair_sorted']
+    counts = routing['counts']
+    padded_counts = [((c + MX_ALIGN - 1) // MX_ALIGN) * MX_ALIGN for c in counts]
+    total_padded = sum(padded_counts)
+    idx_pair = torch.full((total_padded,), -1, device='cuda', dtype=torch.int32)
+    read_ptr = write_ptr = 0
+    for c, pc in zip(counts, padded_counts):
+        if c:
+            idx_pair[write_ptr : write_ptr + c] = pair_sorted[read_ptr : read_ptr + c]
+        read_ptr += c
+        write_ptr += pc
+    valid = idx_pair >= 0
+    safe_pair = torch.where(valid, idx_pair, torch.zeros_like(idx_pair)).long()
+    tok = safe_pair // top_k
+    route = safe_pair % top_k
+    offs = torch.cumsum(torch.tensor(padded_counts, device='cuda', dtype=torch.int32), dim=0).to(torch.int32)
+    return {
+        'xg': x[tok],
+        'wg': (topk_weights[tok, route] * valid.to(torch.float32)).to(torch.bfloat16),
+        'offs': offs,
+        'tok': tok,
+        'valid': valid,
+    }
 
 
 # ---------------------------------------------------------------- the two implementations
 
 
-def torch_naive_bf16(parts: dict, w1: torch.Tensor, w2: torch.Tensor) -> list[torch.Tensor]:
-    outs = []
-    for e, x in enumerate(parts['x']):
-        gate_up = x @ w1[e].T
-        gate, up = gate_up.chunk(2, dim=-1)
-        act = F.silu(gate) * up
-        expert_out = act @ w2[e].T
-        outs.append(parts['w'][e] * expert_out)
-    return outs
+def torch_grouped_bf16(xg: torch.Tensor, w1t: torch.Tensor, w2t: torch.Tensor, offs: torch.Tensor, wg: torch.Tensor) -> torch.Tensor:
+    gate_up = F.grouped_mm(xg, w1t, offs=offs, out_dtype=torch.bfloat16)
+    gate, up = gate_up.chunk(2, dim=-1)
+    act = F.silu(gate) * up
+    expert_out = F.grouped_mm(act, w2t, offs=offs, out_dtype=torch.bfloat16)
+    return wg.unsqueeze(1) * expert_out
 
 
-def torch_naive_mxfp8(parts: dict, w1q: torch.Tensor, w1sf: torch.Tensor, w2q: torch.Tensor, w2sf: torch.Tensor) -> list[torch.Tensor]:
-    outs = []
-    for e, x in enumerate(parts['x']):
-        gate_up = mx_mm(x, parts['x_sf'][e], w1q[e], w1sf[e])
-        gate, up = gate_up.chunk(2, dim=-1)
-        act = F.silu(gate) * up
-        # the kernel requantizes the activation to mxfp8 before the down projection, so the
-        # baseline has to pay for it too or the comparison is not like for like
-        act_q, act_sf = quantize_mx(act)
-        expert_out = mx_mm(act_q, pack_scales_blocked(act_sf).view(act.shape[0], -1), w2q[e], w2sf[e])
-        outs.append(parts['w'][e] * expert_out)
-    return outs
-
-
-def scatter_parts(outs: list[torch.Tensor], parts: dict, out: torch.Tensor) -> torch.Tensor:
-    """Fold the per expert results back into a (T, K) tensor. Setup/checking only, never timed."""
-    out.zero_()
-    for e, y in enumerate(outs):
-        c = parts['rows'][e]
-        if c:
-            out.index_add_(0, parts['tok'][e], y[:c].to(out.dtype))
-    return out
+def torch_grouped_mxfp8(
+    xq: torch.Tensor,
+    xsf: torch.Tensor,
+    w1qt: torch.Tensor,
+    w1sf: torch.Tensor,
+    w2qt: torch.Tensor,
+    w2sf: torch.Tensor,
+    offs: torch.Tensor,
+    wg: torch.Tensor,
+) -> torch.Tensor:
+    gate_up = F.scaled_grouped_mm(xq, w1qt, xsf, MX, w1sf, MX, swizzle_a=SWZ, swizzle_b=SWZ, offs=offs, output_dtype=torch.bfloat16)
+    gate, up = gate_up.chunk(2, dim=-1)
+    act = F.silu(gate) * up
+    # the kernel requantizes the activation to mxfp8 before the down projection, so the
+    # baseline has to pay for it too or the comparison is not like for like
+    act_q, act_sf = quantize_mx(act)
+    act_sf_packed = pack_scales_blocked(act_sf).view(act.shape[0], -1)
+    expert_out = F.scaled_grouped_mm(act_q, w2qt, act_sf_packed, MX, w2sf, MX, swizzle_a=SWZ, swizzle_b=SWZ, offs=offs, output_dtype=torch.bfloat16)
+    return wg.unsqueeze(1) * expert_out
 
 
 def fused_bf16(state: dict) -> torch.Tensor:
@@ -236,6 +266,7 @@ def fused_bf16(state: dict) -> torch.Tensor:
         state['wn'],
         state['stages'],
         state['bpc'],
+        state['cpc'],
     )
     return state['out']
 
@@ -321,8 +352,7 @@ def run_one(dtype: str, num_tokens: int, args: argparse.Namespace) -> dict:
     topk_ids = generate_topk_ids(E, num_tokens, top_k, args.balancedness)
     topk_weights = F.softmax(torch.randn((num_tokens, top_k), dtype=torch.float32, device='cuda'), dim=-1)
 
-    routing = make_routing(topk_ids, block_m, E)
-    parts = gather_per_expert(x, topk_weights, routing, top_k, pad_to=max(block_m, 128))
+    routing = make_routing(topk_ids, block_m, E, args.bpc)
     out = torch.zeros_like(x)
     state = {
         'sorted_token_ids': routing['sorted_token_ids'],
@@ -336,33 +366,42 @@ def run_one(dtype: str, num_tokens: int, args: argparse.Namespace) -> dict:
         'wn': args.wn,
         'stages': args.stages,
         'bpc': args.bpc,
+        'cpc': args.cpc,
     }
 
     if dtype == 'bf16':
         state |= {'x': x, 'w1': w1, 'w2': w2}
-        baseline_fn = lambda: torch_naive_bf16(parts, w1, w2)
+        g = build_grouped_bf16_inputs(x, topk_weights, routing, top_k)
+        w1t, w2t = w1.transpose(1, 2), w2.transpose(1, 2)
+        baseline_fn = lambda: torch_grouped_bf16(g['xg'], w1t, w2t, g['offs'], g['wg'])
         fused_fn = lambda: fused_bf16(state)
+        scatter_tok, scatter_mask = g['tok'], None
     else:
         x_q, x_sf = quantize_mx(x)
         w1_q, w1_sf = quantize_mx(w1)
         w2_q, w2_sf = quantize_mx(w2)
-        # per expert activation tiles, quantized and swizzled once during setup, replacing the
-        # bf16 tiles in place so the padded bf16 copies can be freed
-        parts['x_sf'] = [None] * len(parts['x'])
-        for i, xe in enumerate(parts['x']):
-            q, sf = quantize_mx(xe)
-            parts['x'][i] = q
-            parts['x_sf'][i] = pack_scales_blocked(sf).view(q.shape[0], -1)
-        del xe
         w1_sf_e = pack_scales_blocked(w1_sf).view(E, N, K // BLOCK)
         w2_sf_e = pack_scales_blocked(w2_sf).view(E, K, (N // 2) // BLOCK)
         state |= {'x': x_q, 'x_sf': x_sf, 'w1': w1_q, 'w1_sf': w1_sf_e, 'w2': w2_q, 'w2_sf': w2_sf_e}
-        baseline_fn = lambda: torch_naive_mxfp8(parts, w1_q, w1_sf_e, w2_q, w2_sf_e)
+
+        g = build_grouped_mxfp8_inputs(x, topk_weights, routing, top_k)
+        gxq, gxsf = quantize_mx(g['xg'])
+        gxsf_packed = pack_scales_blocked(gxsf).view(gxq.shape[0], -1)
+        w1_sf_flat = w1_sf_e.reshape(E, -1)
+        w2_sf_flat = w2_sf_e.reshape(E, -1)
+        w1_qt, w2_qt = w1_q.transpose(1, 2), w2_q.transpose(1, 2)
+        baseline_fn = lambda: torch_grouped_mxfp8(gxq, gxsf_packed, w1_qt, w1_sf_flat, w2_qt, w2_sf_flat, g['offs'], g['wg'])
         fused_fn = lambda: fused_mxfp8(state)
+        scatter_tok, scatter_mask = g['tok'], g['valid']
 
     max_abs = rel = float('nan')
     if args.check and not args.skip_fused:
-        ref = scatter_parts(baseline_fn(), parts, torch.zeros_like(x))
+        base_out = baseline_fn()
+        ref = torch.zeros_like(x)
+        if scatter_mask is None:
+            ref.index_add_(0, scatter_tok, base_out.to(x.dtype))
+        else:
+            ref.index_add_(0, scatter_tok[scatter_mask], base_out[scatter_mask].to(x.dtype))
         got = fused_fn().clone()
         torch.cuda.synchronize()
         diff = (ref.float() - got.float()).abs()
@@ -372,14 +411,14 @@ def run_one(dtype: str, num_tokens: int, args: argparse.Namespace) -> dict:
     baseline_run = baseline_fn
     fused_run = fused_fn
     if args.cuda_graphs:
-        g = graphed(baseline_fn)
-        baseline_run = g or baseline_fn
-        if g is None:
+        g_ = graphed(baseline_fn)
+        baseline_run = g_ or baseline_fn
+        if g_ is None:
             print('  note: CUDA graph capture failed for the torch baseline, timing it eagerly')
         if not args.skip_fused:
-            g = graphed(fused_fn)
-            fused_run = g or fused_fn
-            if g is None:
+            g_ = graphed(fused_fn)
+            fused_run = g_ or fused_fn
+            if g_ is None:
                 print('  note: CUDA graph capture failed for the fused kernel, timing it eagerly')
 
     baseline_ms = bench_cuda(baseline_run, args.warmup, args.iters)
@@ -401,7 +440,7 @@ def run_one(dtype: str, num_tokens: int, args: argparse.Namespace) -> dict:
         'max_abs': max_abs,
         'rel': rel,
     }
-    del state, parts, baseline_run, fused_run, baseline_fn, fused_fn
+    del state, baseline_run, fused_run, baseline_fn, fused_fn
     torch.cuda.synchronize()
     torch.cuda.empty_cache()
     return row
@@ -414,7 +453,7 @@ def fmt_tokens(t: int) -> str:
     return f'{t // 1024}k' if t >= 1024 and t % 1024 == 0 else str(t)
 
 
-BASELINE_LABEL = {'bf16': 'torch naive (bf16)', 'mxfp8': 'torch naive (mxfp8 scaled_mm)'}
+BASELINE_LABEL = {'bf16': 'torch grouped_mm (bf16)', 'mxfp8': 'torch scaled_grouped_mm (mxfp8)'}
 FUSED_LABEL = {'bf16': 'fused MoE (bf16)', 'mxfp8': 'fused MoE (mxfp8)'}
 
 
@@ -445,7 +484,7 @@ def plot_dtype(dtype: str, rows: list[dict], path: str, subtitle: str) -> None:
     speedup = [r['speedup'] for r in rows]
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12.5, 5.0), facecolor=SURFACE)
-    fig.suptitle(f'Fused MoE vs naive torch — {dtype}', x=0.012, y=0.965, ha='left', fontsize=15, color=INK, weight='bold')
+    fig.suptitle(f'Fused MoE vs torch grouped GEMM — {dtype}', x=0.012, y=0.965, ha='left', fontsize=15, color=INK, weight='bold')
     fig.text(0.012, 0.912, subtitle, ha='left', fontsize=9.5, color=INK_SOFT)
 
     for ax in (ax1, ax2):
@@ -516,6 +555,7 @@ def main() -> None:
     p.add_argument('--wn', type=int, default=8)
     p.add_argument('--stages', type=int, default=4)
     p.add_argument('--bpc', type=int, default=1)
+    p.add_argument('--cpc', type=int, default=1, help='bf16 only: intermediate 128-col groups per CTA, cuts the down-projection split-K factor by this much')
     p.add_argument('--iters', type=int, default=50)
     p.add_argument('--warmup', type=int, default=10)
     p.add_argument('--seed', type=int, default=0)
@@ -537,7 +577,7 @@ def main() -> None:
         f'median of {args.iters} runs, {"CUDA graph replay" if args.cuda_graphs else "eager"}'
     )
     print(subtitle)
-    print('baseline timing covers the expert matmuls, SwiGLU and the routing scale only; gather/scatter are excluded')
+    print('baseline timing covers the grouped GEMMs, SwiGLU and the routing scale only; gather/scatter are excluded')
 
     all_rows = []
     for dtype in args.dtypes:
