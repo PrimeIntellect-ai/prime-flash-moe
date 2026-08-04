@@ -106,7 +106,8 @@ columns already fill the 512-column tensor memory.
 
 `block_n`/`warp_n` and `stages` are exposed rather than auto-tuned. `(32, 8)` tends to win
 for narrow `N`, `(64, 4)` for wider. More stages buys more prefetch overlap at the cost of
-shared memory. Sweep them for your shapes — `benchmark/benchmark.py` does this.
+shared memory. Sweep them for your shapes — `benchmark/benchmark.py` exposes them as
+`--bn/--wn/--stages`.
 
 ## Usage
 
@@ -140,8 +141,18 @@ Pack the weight scales once at load time, not per step.
 ```sh
 python test/test.py           # bf16 path vs a torch._grouped_mm reference
 python test/test_mxfp8.py     # mxfp8 path vs the same reference on dequantized values
-python benchmark/benchmark.py --check --iters 1000
+python benchmark/benchmark.py --check           # both dtypes vs a naive torch expert loop
 ```
+
+The benchmark sweeps token counts for `bf16` and `mxfp8`, prints one table per dtype
+(plain and markdown), and writes `moe_bench_bf16.png`, `moe_bench_mxfp8.png` and
+`moe_bench.csv`. The baseline is the textbook expert loop — `x @ w1[e].T`, SwiGLU,
+`act @ w2[e].T`, routing scale — in bf16, and the same loop over
+`torch.nn.functional.scaled_mm` with 1x32 e8m0 block scales for mxfp8. Routing, the
+per-expert gather and the final scatter happen during setup and are outside the timed
+region, so the baseline is charged for arithmetic only; both sides are timed as CUDA graph
+replays. Shapes and tuning knobs are flags (`--tokens --experts --top-k --hidden --inter
+--bn --wn --stages`); `--skip-fused` times the torch side alone on a non-Blackwell box.
 
 Both test scripts sweep shapes and tuning configs, print per-config error statistics, and
 exit non-zero if any config exceeds its accuracy gate. The gates (`REL_CLAMP_10_MAX`,
