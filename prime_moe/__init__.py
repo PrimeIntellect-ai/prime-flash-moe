@@ -100,6 +100,18 @@ def fused_moe_mxfp8(
     )
     return out
 
+
+def pack_scales_blocked(scales: torch.Tensor) -> torch.Tensor:
+    """Reorder row major weight scales into the blocked layout the kernel reads."""
+    u = scales.view(torch.uint8)
+    lead = u.shape[:-2]
+    mn, kb = u.shape[-2:]
+    assert (mn&128) == 0, f'MN ({mn}) must be a multiple of 128'
+    assert (kb&3) == 0, f'K ({kb<<5}) must be a multiple of 128'
+    t = u.reshape(-1, mn>>7, 4, 32, kb>>2, 4)
+    t = t.permute(0, 1, 4, 3, 2, 5).contiguous()
+    return t.reshape(*lead, -1).view(torch.float8_e8m0fnu)
+
 __all__ = [
     'fused_moe_bf16',
     'fused_moe_mxfp8',
