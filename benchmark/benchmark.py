@@ -60,7 +60,6 @@ except Exception as exc:  # the extension may not be built for this box
     KERNEL_IMPORT_ERROR = exc
 
     def pack_scales_blocked(scales: torch.Tensor) -> torch.Tensor:
-        """Local copy of the blocked scale packer, so the torch side runs without the extension."""
         u = scales.view(torch.uint8)
         lead = u.shape[:-2]
         mn, kb = u.shape[-2:]
@@ -78,8 +77,6 @@ E4M3_EMAX = 8  # 448 == 1.75 * 2**8
 MX = ScalingType.BlockWise1x32
 SWZ = SwizzleType.SWIZZLE_32_4_4
 
-# validated categorical slots 1/2/3 (see the dataviz palette), light surface; the
-# speedup bars reuse the comparator's slot so color follows the entity across panels
 SURFACE = '#fcfcfb'
 INK = '#0b0b0b'
 INK_SOFT = '#52514e'
@@ -88,17 +85,12 @@ C_TORCH = '#2a78d6'
 C_FUSED = '#eb6834'
 C_NAIVE = '#1baf7a'
 
-
-# ---------------------------------------------------------------- mxfp8 helpers
-
-
 def _shared_exponent(amax: torch.Tensor) -> torch.Tensor:
     bits = amax.float().contiguous().view(torch.int32)
     return (((bits >> 23) & 0xFF) - E4M3_EMAX).clamp_(0, 254)
 
 
 def quantize_mx(t: torch.Tensor, block: int = BLOCK) -> tuple[torch.Tensor, torch.Tensor]:
-    """Quantize the last dim of ``t`` to MXFP8, returning ``(e4m3 values, e8m0 scales)``."""
     k = t.shape[-1]
     assert k % block == 0, f'last dim {k} must be a multiple of {block}'
     g = t.float().reshape(*t.shape[:-1], k // block, block)
@@ -114,9 +106,6 @@ def dequantize_mx(q: torch.Tensor, scales: torch.Tensor, block: int = BLOCK) -> 
     scale = torch.exp2((e - 127).float())
     g = q.float().reshape(*q.shape[:-1], k // block, block) * scale.unsqueeze(-1)
     return g.reshape(*q.shape[:-1], k)
-
-
-# ---------------------------------------------------------------- routing
 
 
 def generate_topk_ids(num_experts: int, num_tokens: int, top_k: int, balancedness: float = 1.0) -> torch.Tensor:
@@ -173,11 +162,6 @@ def make_routing(topk_ids: torch.Tensor, block_m: int, num_experts: int, bpc: in
 
 
 def build_grouped_bf16_inputs(x: torch.Tensor, topk_weights: torch.Tensor, routing: dict, top_k: int) -> dict:
-    """Flatten the sorted (token, slot) pairs into one contiguous gather, no per-expert padding.
-
-    bf16 ``grouped_mm`` accepts ragged group sizes directly, so this is exactly what a real
-    caller without a fused kernel would do: one gather, one offsets tensor, no expert loop.
-    """
     pair_sorted = routing['pair_sorted']
     tok = (pair_sorted // top_k).long()
     route = pair_sorted % top_k
@@ -191,13 +175,6 @@ def build_grouped_bf16_inputs(x: torch.Tensor, topk_weights: torch.Tensor, routi
 
 
 def build_grouped_mxfp8_inputs(x: torch.Tensor, topk_weights: torch.Tensor, routing: dict, top_k: int) -> dict:
-    """Same idea as the bf16 gather, but each expert's slice is padded to a multiple of 128 rows.
-
-    ``scaled_grouped_mm`` swizzles MX block scales in 128 row tiles; a group boundary that
-    doesn't land on a tile boundary would mix scale factors across experts. Padding rows are
-    real (safe, clamped) gathers so quantization never sees garbage; they're masked out again
-    whenever the result is actually used for correctness (never during timing).
-    """
     pair_sorted = routing['pair_sorted']
     counts = routing['counts']
     padded_counts = [((c + MX_ALIGN - 1) // MX_ALIGN) * MX_ALIGN for c in counts]
@@ -225,16 +202,11 @@ def build_grouped_mxfp8_inputs(x: torch.Tensor, topk_weights: torch.Tensor, rout
 
 
 def expert_bounds(counts: list[int]) -> list[tuple[int, int]]:
-    """Host-side (start, end) row ranges per expert, so the naive loop slices with python ints."""
     bounds, ptr = [], 0
     for c in counts:
         bounds.append((ptr, ptr + c))
         ptr += c
     return bounds
-
-
-# ---------------------------------------------------------------- the three implementations
-
 
 def torch_naive_bf16(xg: torch.Tensor, w1: torch.Tensor, w2: torch.Tensor, bounds: list[tuple[int, int]], wg: torch.Tensor) -> torch.Tensor:
     out = torch.empty((xg.shape[0], w2.shape[1]), dtype=torch.bfloat16, device=xg.device)
@@ -258,8 +230,6 @@ def torch_naive_mxfp8(
     bounds: list[tuple[int, int]],
     wg: torch.Tensor,
 ) -> torch.Tensor:
-    # the mxfp8 groups are padded to 128 rows, so every slice starts on a scale swizzle
-    # tile boundary and the packed per-row scales can be sliced right along with the data
     out = torch.empty((xq.shape[0], w2q.shape[1]), dtype=torch.bfloat16, device=xq.device)
     for e, (s, t) in enumerate(bounds):
         if s == t:
@@ -295,8 +265,6 @@ def torch_grouped_mxfp8(
     gate_up = F.scaled_grouped_mm(xq, w1qt, xsf, MX, w1sf, MX, swizzle_a=SWZ, swizzle_b=SWZ, offs=offs, output_dtype=torch.bfloat16)
     gate, up = gate_up.chunk(2, dim=-1)
     act = F.silu(gate) * up
-    # the kernel requantizes the activation to mxfp8 before the down projection, so the
-    # baseline has to pay for it too or the comparison is not like for like
     act_q, act_sf = quantize_mx(act)
     act_sf_packed = pack_scales_blocked(act_sf).view(act.shape[0], -1)
     expert_out = F.scaled_grouped_mm(act_q, w2qt, act_sf_packed, MX, w2sf, MX, swizzle_a=SWZ, swizzle_b=SWZ, offs=offs, output_dtype=torch.bfloat16)
@@ -304,7 +272,6 @@ def torch_grouped_mxfp8(
 
 
 def fused_bf16(state: dict) -> torch.Tensor:
-    # the split pipeline (cluster=8) zeroes out internally, overlapped under its up kernel
     if state['cluster'] != 8:
         state['out'].zero_()
     torch.ops.prime_moe.fused_moe_bf16(
@@ -329,7 +296,6 @@ def fused_bf16(state: dict) -> torch.Tensor:
 
 
 def fused_mxfp8(state: dict) -> torch.Tensor:
-    # the split pipeline (cluster=8) zeroes out internally, overlapped under its up kernel
     if state['cluster'] != 8:
         state['out'].zero_()
     torch.ops.prime_moe.fused_moe_mxfp8(
@@ -355,11 +321,7 @@ def fused_mxfp8(state: dict) -> torch.Tensor:
     return state['out']
 
 
-# ---------------------------------------------------------------- timing
-
-
 def graphed(fn: Callable[[], object], warmup: int = 3) -> Callable[[], object] | None:
-    """Capture ``fn`` into a CUDA graph and return a replay callable, or ``None`` if capture fails."""
     try:
         side = torch.cuda.Stream()
         side.wait_stream(torch.cuda.current_stream())
@@ -397,15 +359,9 @@ def approx_flops(num_tokens: int, top_k: int, K: int, N: int) -> float:
     pairs = num_tokens * top_k
     return 2.0 * pairs * K * N + 2.0 * pairs * (N // 2) * K
 
-
-# ---------------------------------------------------------------- one measurement
-
-
 def run_one(dtype: str, num_tokens: int, args: argparse.Namespace) -> dict:
     E, K, N, top_k = args.experts, args.hidden, 2 * args.inter, args.top_k
     block_m = args.block_m
-    # measured dispatch policy (B200): the bf16 split pipeline beats the fused kernel at every
-    # size; the mxfp8 split only pays for its act round-trip once the batch is large enough
     cluster = args.cluster if args.cluster is not None else (8 if dtype == 'bf16' or num_tokens >= 4096 else 1)
     torch.manual_seed(args.seed)
 
@@ -535,15 +491,12 @@ def run_one(dtype: str, num_tokens: int, args: argparse.Namespace) -> dict:
     return row
 
 
-# ---------------------------------------------------------------- reporting
-
-
 def fmt_tokens(t: int) -> str:
     return f'{t // 1024}k' if t >= 1024 and t % 1024 == 0 else str(t)
 
 
 BASELINE_LABEL = {'bf16': 'torch grouped_mm (bf16)', 'mxfp8': 'torch scaled_grouped_mm (mxfp8)'}
-NAIVE_LABEL = {'bf16': 'naive expert loop (bf16)', 'mxfp8': 'naive expert loop (mxfp8)'}
+NAIVE_LABEL = {'bf16': 'torch naive expert loop (bf16)', 'mxfp8': 'naive expert loop (mxfp8)'}
 FUSED_LABEL = {'bf16': 'fused MoE (bf16)', 'mxfp8': 'fused MoE (mxfp8)'}
 
 
@@ -580,7 +533,7 @@ def print_table(dtype: str, rows: list[dict]) -> None:
         print('| ' + ' | '.join(b) + ' |')
 
 
-def plot_dtype(dtype: str, rows: list[dict], path: str, subtitle: str) -> None:
+def plot_dtype(dtype: str, rows: list[dict], path: str) -> None:
     labels = [fmt_tokens(r['tokens']) for r in rows]
     xs = list(range(len(rows)))
     naive = [r['naive_ms'] for r in rows]
@@ -591,8 +544,7 @@ def plot_dtype(dtype: str, rows: list[dict], path: str, subtitle: str) -> None:
     have_naive = all(v == v for v in naive)
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12.5, 5.0), facecolor=SURFACE)
-    fig.suptitle(f'Fused MoE vs torch baselines — {dtype}', x=0.012, y=0.965, ha='left', fontsize=15, color=INK, weight='bold')
-    fig.text(0.012, 0.912, subtitle, ha='left', fontsize=9.5, color=INK_SOFT)
+    fig.suptitle(f'Fused MoE vs torch baselines — {dtype}', x=0.012, y=0.97, ha='left', fontsize=15, color=INK, weight='bold')
 
     for ax in (ax1, ax2):
         ax.set_facecolor(SURFACE)
@@ -652,7 +604,7 @@ def plot_dtype(dtype: str, rows: list[dict], path: str, subtitle: str) -> None:
     ax2.set_ylim(0, max(tops) * 1.22)
     ax2.set_title('fused speedup over each baseline', fontsize=10.5, color=INK, loc='left', pad=10)
 
-    fig.tight_layout(rect=(0, 0, 1, 0.9))
+    fig.tight_layout(rect=(0, 0, 1, 0.94))
     fig.savefig(path, dpi=170, facecolor=SURFACE)
     plt.close(fig)
 
@@ -741,7 +693,7 @@ def main() -> None:
         print_table(dtype, rows)
         if not args.skip_fused:
             png = f'{args.outdir.rstrip("/")}/moe_bench_{dtype}.png'
-            plot_dtype(dtype, rows, png, subtitle)
+            plot_dtype(dtype, rows, png)
             print(f'wrote {png}')
 
     if all_rows:
