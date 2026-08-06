@@ -19,8 +19,9 @@ def fused_moe_bf16_abstract(
     warp_n: int,
     stages: int,
     bpc: int,
+    cpc: int,
+    cluster: int,
 ) -> None:
-    # the op schema is `-> ()` with `Tensor(a!) out`; a fake impl must return None to match it
     return None
 
 
@@ -39,10 +40,12 @@ def fused_moe_bf16(
     warp_n: int,
     stages: int,
     bpc: int = 1,
+    cpc: int = 1,
+    cluster: int = 1,
 ) -> torch.Tensor:
-    """Run the fused bf16 MoE. Writes into ``out`` in place and returns it for convenience."""
     torch.ops.prime_moe.fused_moe_bf16(
-        x, w, w2, sorted_token_ids, expert_ids, num_tokens_post_padded, topk_weights, out, top_k, block_m, block_n, warp_n, stages, bpc
+        x, w, w2, sorted_token_ids, expert_ids, num_tokens_post_padded, topk_weights, out,
+        top_k, block_m, block_n, warp_n, stages, bpc, cpc, cluster
     )
     return out
 
@@ -65,8 +68,8 @@ def fused_moe_mxfp8_abstract(
     warp_n: int,
     stages: int,
     bpc: int,
+    cluster: int,
 ) -> None:
-    # the op schema is `-> ()` with `Tensor(a!) out`; a fake impl must return None to match it
     return None
 
 
@@ -88,16 +91,26 @@ def fused_moe_mxfp8(
     warp_n: int,
     stages: int,
     bpc: int = 1,
+    cluster: int = 1,
 ) -> torch.Tensor:
-    """Run the fused mxfp8 MoE. Writes into ``out`` in place and returns it for convenience.
-
-    ``w_scales`` and ``w2_scales`` must already be in the blocked layout produced by
-    :func:`prime_moe.pack_scales_blocked`; ``x_scales`` stays row major ``(M, K // 32)``.
-    """
     torch.ops.prime_moe.fused_moe_mxfp8(
-        x, x_scales, w, w_scales, w2, w2_scales, sorted_token_ids, expert_ids, num_tokens_post_padded, topk_weights, out, top_k, block_m, block_n, warp_n, stages, bpc
+        x, x_scales, w, w_scales, w2, w2_scales, sorted_token_ids, expert_ids,
+        num_tokens_post_padded, topk_weights, out,
+        top_k, block_m, block_n, warp_n, stages, bpc, cluster
     )
     return out
+
+
+def pack_scales_blocked(scales: torch.Tensor) -> torch.Tensor:
+    """Reorder row major weight scales into the blocked layout the kernel reads."""
+    u = scales.view(torch.uint8)
+    lead = u.shape[:-2]
+    mn, kb = u.shape[-2:]
+    assert (mn&128) == 0, f'MN ({mn}) must be a multiple of 128'
+    assert (kb&3) == 0, f'K ({kb<<5}) must be a multiple of 128'
+    t = u.reshape(-1, mn>>7, 4, 32, kb>>2, 4)
+    t = t.permute(0, 1, 4, 3, 2, 5).contiguous()
+    return t.reshape(*lead, -1).view(torch.float8_e8m0fnu)
 
 __all__ = [
     'fused_moe_bf16',
