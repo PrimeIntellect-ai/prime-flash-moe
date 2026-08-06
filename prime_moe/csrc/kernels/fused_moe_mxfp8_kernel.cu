@@ -53,7 +53,7 @@ namespace pi {
     static_assert(mxfp8_pod_alias<4, 8, 128, 128, 32>);
     static_assert(mxfp8_pod_alias<4, 4, 128, 128, 64>);
 
-    template <int BM, int BK, int BN, int WN, int STAGES, int PRODUCER_THREADS>
+    template <int BM, int BK, int BN, int WN, int STAGES, int PRODUCER_THREADS, bool SPLIT_UP = false>
     static __global__ __launch_bounds__(WN*32 + PRODUCER_THREADS) void fused_moe_mxfp8_kernel(
         const __nv_fp8_e4m3 *__restrict__ x,
         const uint8_t *__restrict__ x_scales,
@@ -61,6 +61,8 @@ namespace pi {
         const uint8_t *__restrict__ w_scales,
         const __grid_constant__ CUtensorMap map_w2,
         const uint8_t *__restrict__ w2_scales,
+        const __grid_constant__ CUtensorMap map_act,
+        uint8_t *__restrict__ sf_ws,
         __nv_bfloat16 *__restrict__ out,
         const int32_t *__restrict__ sorted_token_ids,
         const int32_t *__restrict__ expert_idxs,
@@ -139,11 +141,11 @@ namespace pi {
         int n_stages_down = N2 / BN2;
         int phase = 0;
         const auto producer = [&] {
+            static constexpr int SFW_CHUNKS = (NSFW*SFT)>>3;
+            static constexpr int SFW2_CHUNKS = (NSFW2*SFT)>>3;
             static constexpr int CHUNKS_PER_ROW = BK>>4;   // 16 e4m3 per 16B chunk
             static_assert(!(CHUNKS_PER_ROW&(CHUNKS_PER_ROW-1)));
             static constexpr int ROWS_PER_WAVE = PRODUCER_THREADS / CHUNKS_PER_ROW;
-            static constexpr int SFW_CHUNKS = (NSFW*SFT)>>3;
-            static constexpr int SFW2_CHUNKS = (NSFW2*SFT)>>3;
             int smem_stage = 0;
             for (int stage=0; stage < n_stages_up; ++stage) {
                 if (smem_stage == STAGES) {
@@ -199,6 +201,7 @@ namespace pi {
                 }
                 ++smem_stage;
             }
+            if constexpr (SPLIT_UP) return;
             auto &smem_down = *reinterpret_cast<smem_down_pod_mxfp8<STAGES, WN, BM, BK, BN> *>(smem_raw);
             for (int stage=0; stage < n_stages_down; ++stage) {
                 if (smem_stage == STAGES) {
@@ -291,18 +294,15 @@ namespace pi {
                 for (int g=0; g < BK2>>5; ++g) {
                     float act[32];
                     float amax = 0.f;
-                    #pragma unroll
-                    for (int c=0; c < 4; ++c) {
-                        float gate[8];
-                        float up[8];
-                        int col = (g<<5)+(c<<3);
-                        tcgen05::ld_32x32b_x8(gate, tcgen05::tmem_addr(tmem_acc, row, col));
-                        tcgen05::ld_32x32b_x8(up, tcgen05::tmem_addr(tmem_acc, row, BK2+col));
+                    {
+                        float gate[32];
+                        tcgen05::ld_32x32b_x32(gate, tcgen05::tmem_addr(tmem_acc, row, g<<5));
+                        tcgen05::ld_32x32b_x32(act, tcgen05::tmem_addr(tmem_acc, row, BK2+(g<<5)));
                         tcgen05::await_ld();
                         #pragma unroll
-                        for (int e=0; e < 8; ++e) {
-                            float v = swiglu(gate[e], up[e]);
-                            act[(c<<3)+e] = v;
+                        for (int e=0; e < 32; ++e) {
+                            float v = swiglu(gate[e], act[e]);
+                            act[e] = v;
                             amax = fmaxf(amax, fabsf(v));
                         }
                     }
@@ -319,6 +319,23 @@ namespace pi {
             }
             cuda::ptx::fence_proxy_async(cuda::ptx::space_shared);
             con_sync();
+            if constexpr (SPLIT_UP) {
+                if (live) {
+                    for (int i=threadIdx.x-PRODUCER_THREADS; i < SFT>>2; i += CONSUMER_THREADS)
+                        if (i >= 0)
+                            reinterpret_cast<uint32_t *>(sf_ws + (static_cast<size_t>(block_base)*gridDim.x + blockIdx.x)*SFT)[i] =
+                                reinterpret_cast<const uint32_t *>(smem_down.sfx)[i];
+                    if (warp_id == 0 && lane_id == 0) {
+                        cp_async_extra::store3d(&map_act, smem_down.x, 0, block_base*BM, blockIdx.x*(BK2>>4));
+                        cuda::ptx::cp_async_bulk_commit_group();
+                        asm volatile("cp.async.bulk.wait_group 0;\n" ::: "memory");
+                        cudaTriggerProgrammaticLaunchCompletion();
+                    }
+                }
+                if (threadIdx.x >= PRODUCER_THREADS && threadIdx.x < PRODUCER_THREADS+32)
+                    tcgen05::tmem_free(tmem_acc, TMEM_COLS);
+                return;
+            }
             idesc = tcgen05::encode_idesc_block_scaled_e4m3(BM, BN2);
             for (int stage=0; stage < n_stages_down; ++stage) {
                 if (smem_stage == STAGES) {
@@ -401,7 +418,158 @@ namespace pi {
         else consumer();
     }
 
-    template <int BM, int BN, int WN, int STAGES>
+    template <int STAGES, int CK, int TCN, int BM>
+    struct smem_down_split_pod_mxfp8 {
+        alignas(1024) __nv_fp8_e4m3 w[STAGES*TCN*CK];
+        alignas(1024) uint8_t sfw[STAGES*(TCN/128)*512];
+        alignas(1024) uint8_t sfx[STAGES*512];
+        alignas(1024) __nv_fp8_e4m3 x[STAGES*BM*CK];
+    };
+
+    template <int BM, int CK, int TCN, int STAGES, int PRODUCER_THREADS>
+    static __global__ __launch_bounds__(128+PRODUCER_THREADS) void fused_moe_mxfp8_down_kernel(
+        const __grid_constant__ CUtensorMap map_act,
+        const uint8_t *__restrict__ sf_act,
+        const __grid_constant__ CUtensorMap map_w2,
+        const uint8_t *__restrict__ w2_scales,
+        __nv_bfloat16 *__restrict__ out,
+        const int32_t *__restrict__ sorted_token_ids,
+        const int32_t *__restrict__ expert_idxs,
+        const int32_t *__restrict__ num_tokens_post_padded,
+        const float *__restrict__ topk_weights,
+        int32_t top_k,
+        int M,
+        int K,
+        int H
+    ) {
+        static constexpr int SFT = 512;
+        static constexpr int NSFW = TCN/128;
+        static constexpr int WSD = TCN*CK;
+        static constexpr int XSD = BM*CK;
+        static constexpr int KB = CK>>5;
+        alignas(1024) extern __shared__ uint8_t smem_raw[];
+        auto &smem = *reinterpret_cast<smem_down_split_pod_mxfp8<STAGES, CK, TCN, BM> *>(smem_raw);
+        alignas(8) __shared__ barrier bar_copy[STAGES];
+        alignas(8) __shared__ barrier bar_recycle[STAGES];
+        alignas(8) __shared__ barrier bar_mma[STAGES];
+        alignas(4) __shared__ uint32_t tmem_acc;
+        __shared__ float topk_scales[BM];
+        __shared__ int32_t row_tok[BM];
+
+        const int by_row = static_cast<int>(blockIdx.y);
+        const int bx_col = static_cast<int>(blockIdx.x);
+        if (BM*by_row >= *num_tokens_post_padded) return;
+        int expert_idx = expert_idxs[by_row];
+        int lane_id = threadIdx.x&31;
+        bool is_prod = threadIdx.x < PRODUCER_THREADS;
+        int warp_id = (is_prod ? threadIdx.x : threadIdx.x-PRODUCER_THREADS) >> 5;
+        if (!threadIdx.x) {
+            for (int i=0; i < STAGES; ++i) {
+                bar_copy[i].init(PRODUCER_THREADS+1);
+                bar_recycle[i].init(1);
+                bar_mma[i].init(1);
+            }
+            asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
+        }
+        __syncthreads();
+        if (threadIdx.x >= PRODUCER_THREADS && threadIdx.x < PRODUCER_THREADS+32)
+            tcgen05::tmem_alloc(&tmem_acc, 512);
+        __syncthreads();
+        for (int r = threadIdx.x; r < BM; r += blockDim.x) {
+            int tdest = sorted_token_ids[by_row*BM+r];
+            row_tok[r] = tdest >= 0 ? tdest / top_k : -1;
+            if (tdest >= 0 && row_tok[r] < M) topk_scales[r] = topk_weights[tdest];
+        }
+        __syncthreads();
+        int n_stages = H / CK;
+        if (is_prod) {
+            cudaGridDependencySynchronize();
+            int smem_stage = 0, phase = 0;
+            for (int stage=0; stage < n_stages; ++stage) {
+                if (smem_stage == STAGES) { phase^=1; smem_stage = 0; }
+                bar_recycle[smem_stage].await(phase);
+                for (int i=threadIdx.x; i < SFT>>3; i += PRODUCER_THREADS)
+                    cp_async::cg64<8>(
+                        static_cast<uint32_t>(__cvta_generic_to_shared(smem.sfx+smem_stage*SFT+(i<<3))),
+                        sf_act + (static_cast<size_t>(by_row)*n_stages + stage)*SFT + (i<<3)
+                    );
+                for (int i=threadIdx.x; i < (NSFW*SFT)>>3; i += PRODUCER_THREADS) {
+                    int j = i/(SFT>>3);
+                    int o = (i-j*(SFT>>3))<<3;
+                    int64_t tile = (static_cast<int64_t>(expert_idx)*(K>>7) + bx_col*NSFW + j)*(H>>7) + stage;
+                    cp_async::cg64<8>(
+                        static_cast<uint32_t>(__cvta_generic_to_shared(smem.sfw+smem_stage*NSFW*SFT+j*SFT+o)),
+                        w2_scales + tile*SFT + o
+                    );
+                }
+                bar_copy[smem_stage].arrive_cp_async_mem();
+                if (!threadIdx.x) {
+                    bar_copy[smem_stage].expect_nb((WSD+XSD)*sizeof(__nv_fp8_e4m3));
+                    cp_async::load3d(smem.w+smem_stage*WSD, &map_w2, *bar_copy[smem_stage],
+                                     0, expert_idx*K+bx_col*TCN, (stage*CK)>>4);
+                    cp_async::load3d(smem.x+smem_stage*XSD, &map_act, *bar_copy[smem_stage],
+                                     0, by_row*BM, stage*(CK>>4));
+                }
+                ++smem_stage;
+            }
+            return;
+        }
+        int tmem_row = (((threadIdx.x>>5)&3)<<5)+lane_id;
+        uint32_t idesc = tcgen05::encode_idesc_block_scaled_e4m3(BM, TCN);
+        if (warp_id == 0 && lane_id == 0) {
+            int smem_stage = 0, phase = 0;
+            for (int i=0; i < STAGES; ++i) bar_recycle[i].arrive();
+            for (int stage=0; stage < n_stages; ++stage) {
+                if (smem_stage == STAGES) { phase^=1; smem_stage = 0; }
+                bar_copy[smem_stage].await(phase);
+                uint32_t sfa = 256u + (stage&1)*16u;      // double-buffered scale columns:
+                uint32_t sfb = sfa + 4u;                  // the next stage never overwrites in-flight SFs
+                tcgen05::cp_sf_32x128b(tmem_acc+sfa, tcgen05::encode_sf_smem_desc(smem.sfx+smem_stage*SFT));
+                #pragma unroll
+                for (int j=0; j < NSFW; ++j)
+                    tcgen05::cp_sf_32x128b(tmem_acc+sfb+(j<<2),
+                        tcgen05::encode_sf_smem_desc(smem.sfw+smem_stage*NSFW*SFT+j*SFT));
+                #pragma unroll
+                for (int k32=0; k32 < KB; ++k32) {
+                    auto *__restrict__ a_ptr = smem.x+smem_stage*XSD+k32*BM*32;
+                    auto *__restrict__ b_ptr = smem.w+smem_stage*WSD+k32*TCN*32;
+                    uint64_t a_desc = tcgen05::encode_smem_desc(a_ptr, BM);
+                    uint64_t b_desc = tcgen05::encode_smem_desc(b_ptr, TCN);
+                    tcgen05::mma_mxf8f6f4(tmem_acc, a_desc, b_desc,
+                        tcgen05::idesc_with_sf_id(idesc, k32),
+                        tmem_acc+sfa, tmem_acc+sfb, stage||k32);
+                }
+                tcgen05::commit_mbarrier(*bar_mma[smem_stage]);
+                bar_mma[smem_stage].await(phase);
+                bar_recycle[smem_stage].arrive();
+                ++smem_stage;
+            }
+        }
+        asm volatile ("bar.sync 1, 128;\n");
+        tcgen05::after_thread_sync();
+        if (warp_id < 4) {
+            float scale = topk_scales[tmem_row];
+            int tok = row_tok[tmem_row];
+            bool row_valid = tok >= 0 && tok < M;
+            __nv_bfloat16 *gdst = out+(row_valid ? static_cast<int64_t>(tok) : 0)*K+bx_col*TCN;
+            #pragma unroll
+            for (int c32=0; c32 < TCN>>5; ++c32) {
+                float vals[32];
+                tcgen05::ld_32x32b_x32(vals, tcgen05::tmem_addr(tmem_acc, tmem_row, c32<<5));
+                tcgen05::await_ld();
+                if (row_valid) {
+                    #pragma unroll
+                    for (int i=0; i < 4; ++i)
+                        red_global_add_bf16x8(gdst+(((c32<<2)+i)<<3), vals+(i<<3), scale);
+                }
+            }
+        }
+        asm volatile ("bar.sync 1, 128;\n");
+        if (threadIdx.x >= PRODUCER_THREADS && threadIdx.x < PRODUCER_THREADS+32)
+            tcgen05::tmem_free(tmem_acc, 512);
+    }
+
+    template <int BM, int BN, int WN, int STAGES, bool SPLIT = false>
     static void launch_fused_moe_mxfp8_kernel(
         const __nv_fp8_e4m3 *x,
         const uint8_t *x_scales,
@@ -424,7 +592,7 @@ namespace pi {
         cudaStream_t stream
     ) {
         static constexpr auto BK = 128;
-        static constexpr auto PRODUCER_THREADS = 128;
+        static constexpr auto PRODUCER_THREADS = 256;
         static constexpr size_t SMEM = std::max(
             sizeof(smem_up_pod_mxfp8<STAGES, WN, BM, BK, BN>),
             sizeof(smem_down_pod_mxfp8<STAGES, WN, BM, BK, BN>)
@@ -435,7 +603,7 @@ namespace pi {
             static_cast<uint32_t>(std::ceil(static_cast<double>(sorted_num)/static_cast<double>(block_m))),
             1
         };
-        auto *kernel = fused_moe_mxfp8_kernel<BM, BK, BN, WN, STAGES, PRODUCER_THREADS>;
+        auto *kernel = fused_moe_mxfp8_kernel<BM, BK, BN, WN, STAGES, PRODUCER_THREADS, SPLIT>;
         if (cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM) != cudaSuccess)
             throw std::runtime_error {"Failed to set max dynamic shared memory size for fused_moe_mxfp8_kernel: "+std::to_string(SMEM)+" bytes"};
 
@@ -456,6 +624,38 @@ namespace pi {
             BK << 1,
             (WN*BN) >> 1
         );
+        const uint64_t HD = static_cast<uint64_t>(N) >> 1;
+        const int n_blocks = sorted_num / BM;
+        __nv_fp8_e4m3 *act_ws = nullptr;
+        uint8_t *sf_ws = nullptr;
+        static cudaStream_t zs = nullptr;
+        static cudaEvent_t ze_head = nullptr, ze_zero = nullptr;
+        if constexpr (SPLIT) {
+            const size_t act_bytes = static_cast<size_t>(sorted_num)*HD;
+            const size_t sf_bytes = static_cast<size_t>(n_blocks)*(HD>>7)*512;
+            if (cudaMallocAsync(&act_ws, act_bytes + sf_bytes, stream) != cudaSuccess)
+                throw std::runtime_error {"failed to allocate the mxfp8 split act workspace"};
+            sf_ws = reinterpret_cast<uint8_t *>(act_ws) + act_bytes;
+            if (!zs) {
+                cudaStreamCreateWithFlags(&zs, cudaStreamNonBlocking);
+                cudaEventCreateWithFlags(&ze_head, cudaEventDisableTiming);
+                cudaEventCreateWithFlags(&ze_zero, cudaEventDisableTiming);
+            }
+            cudaEventRecord(ze_head, stream);
+            cudaStreamWaitEvent(zs, ze_head, 0);
+            cudaMemsetAsync(out, 0, static_cast<size_t>(M)*K*sizeof(__nv_bfloat16), zs);
+            cudaEventRecord(ze_zero, zs);
+        }
+        CUtensorMap map_act = init_tmap<3>(
+            "act_fp8",
+            CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8,
+            SPLIT ? reinterpret_cast<uint8_t *>(act_ws) : reinterpret_cast<uint8_t *>(out),
+            {16ull, static_cast<uint64_t>(sorted_num), HD>>4},
+            {HD, 16ull},
+            {16u, static_cast<uint32_t>(BM), 8u},
+            {1u, 1u, 1u},
+            CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE
+        );
         kernel<<<grid, block, SMEM, stream>>>(
             x,
             x_scales,
@@ -463,6 +663,8 @@ namespace pi {
             w_scales,
             map_w2,
             w2_scales,
+            map_act,
+            sf_ws,
             out,
             sorted_token_ids,
             expert_idxs,
@@ -473,6 +675,39 @@ namespace pi {
             K,
             N
         );
+        if constexpr (SPLIT) {
+            static constexpr int TCN = 256;
+            static constexpr int CK = 128;
+            static constexpr int DSTAGES = 2;
+            static constexpr int DPROD = 128;
+            auto *dkernel = fused_moe_mxfp8_down_kernel<BM, CK, TCN, DSTAGES, DPROD>;
+            static constexpr size_t DSMEM_SZ = sizeof(smem_down_split_pod_mxfp8<DSTAGES, CK, TCN, BM>);
+            if (cudaFuncSetAttribute(dkernel, cudaFuncAttributeMaxDynamicSharedMemorySize, DSMEM_SZ) != cudaSuccess)
+                throw std::runtime_error {"failed to set smem for fused_moe_mxfp8_down_kernel"};
+            cudaStreamWaitEvent(stream, ze_zero, 0);
+            dim3 dgrid = {static_cast<uint32_t>(K/TCN), static_cast<uint32_t>(sorted_num/BM), 1};
+            dim3 dblock = {128+DPROD, 1, 1};
+            cudaLaunchConfig_t dcfg = {};
+            dcfg.gridDim = dgrid;
+            dcfg.blockDim = dblock;
+            dcfg.dynamicSmemBytes = DSMEM_SZ;
+            dcfg.stream = stream;
+            cudaLaunchAttribute dattr[1];
+            dattr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+            dattr[0].val.programmaticStreamSerializationAllowed = 1;
+            dcfg.attrs = dattr;
+            dcfg.numAttrs = 1;
+            cudaError_t derr = cudaLaunchKernelEx(
+                &dcfg, dkernel,
+                map_act, sf_ws, map_w2, w2_scales, out,
+                sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights,
+                static_cast<int32_t>(top_k), M, K, static_cast<int>(HD)
+            );
+            if (derr != cudaSuccess)
+                throw std::runtime_error {"fused_moe_mxfp8_down_kernel launch failed: "+std::string{cudaGetErrorString(derr)}};
+            if (cudaFreeAsync(act_ws, stream) != cudaSuccess)
+                throw std::runtime_error {"failed to free the mxfp8 split act workspace"};
+        }
     }
 
     template <int BM, int BN, int WN>
@@ -496,11 +731,14 @@ namespace pi {
         int num_experts,
         int sorted_num,
         int block_m,
+        int cluster,
         cudaStream_t stream
     ) {
         #define launch_mxfp8(s) \
-            launch_fused_moe_mxfp8_kernel<BM, BN, WN, s>(x, x_scales, w, w_scales, w2, w2_scales, out, sorted_token_ids, expert_idxs, \
-            num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream)
+            do { if (cluster == 8) launch_fused_moe_mxfp8_kernel<BM, BN, WN, s, true>(x, x_scales, w, w_scales, w2, w2_scales, out, sorted_token_ids, expert_idxs, \
+            num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream); \
+            else launch_fused_moe_mxfp8_kernel<BM, BN, WN, s>(x, x_scales, w, w_scales, w2, w2_scales, out, sorted_token_ids, expert_idxs, \
+            num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream); } while (0)
         switch (stages) {
             case 1: launch_mxfp8(1); break;
             case 2: launch_mxfp8(2); break;
@@ -534,14 +772,15 @@ namespace pi {
         int num_experts,
         int sorted_num,
         int block_m,
+        int cluster,
         cudaStream_t stream
     ) {
         switch (((bn&0xff)<<8)+(wn&0xff)) {
             case (32<<8)+8:
-                dispatch_stages_mxfp8<BM, 32, 8>(stages, x, x_scales, w, w_scales, w2, w2_scales, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream);
+                dispatch_stages_mxfp8<BM, 32, 8>(stages, x, x_scales, w, w_scales, w2, w2_scales, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, cluster, stream);
                 break;
             case (64<<8)+4:
-                dispatch_stages_mxfp8<BM, 64, 4>(stages, x, x_scales, w, w_scales, w2, w2_scales, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream);
+                dispatch_stages_mxfp8<BM, 64, 4>(stages, x, x_scales, w, w_scales, w2, w2_scales, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, cluster, stream);
                 break;
             default: throw std::runtime_error {"Invalid BN and WN: "+std::to_string(bn)+" and "+std::to_string(wn)};
         }
@@ -570,6 +809,7 @@ namespace pi {
         int warp_n,
         int stages,
         int bpc,
+        int cluster,
         cudaStream_t stream
     ) {
         if (bpc != 1)
@@ -601,6 +841,7 @@ namespace pi {
                     num_experts,
                     sorted_num,
                     block_m,
+                    cluster,
                     stream
                 );
                 break;

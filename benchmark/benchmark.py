@@ -250,7 +250,9 @@ def torch_grouped_mxfp8(
 
 
 def fused_bf16(state: dict) -> torch.Tensor:
-    state['out'].zero_()
+    # the split pipeline (cluster=8) zeroes out internally, overlapped under its up kernel
+    if state['cluster'] != 8:
+        state['out'].zero_()
     torch.ops.prime_moe.fused_moe_bf16(
         state['x'],
         state['w1'],
@@ -267,12 +269,15 @@ def fused_bf16(state: dict) -> torch.Tensor:
         state['stages'],
         state['bpc'],
         state['cpc'],
+        state['cluster'],
     )
     return state['out']
 
 
 def fused_mxfp8(state: dict) -> torch.Tensor:
-    state['out'].zero_()
+    # the split pipeline (cluster=8) zeroes out internally, overlapped under its up kernel
+    if state['cluster'] != 8:
+        state['out'].zero_()
     torch.ops.prime_moe.fused_moe_mxfp8(
         state['x'],
         state['x_sf'],
@@ -291,6 +296,7 @@ def fused_mxfp8(state: dict) -> torch.Tensor:
         state['wn'],
         state['stages'],
         state['bpc'],
+        state['cluster'],
     )
     return state['out']
 
@@ -352,7 +358,10 @@ def run_one(dtype: str, num_tokens: int, args: argparse.Namespace) -> dict:
     topk_ids = generate_topk_ids(E, num_tokens, top_k, args.balancedness)
     topk_weights = F.softmax(torch.randn((num_tokens, top_k), dtype=torch.float32, device='cuda'), dim=-1)
 
-    routing = make_routing(topk_ids, block_m, E, args.bpc)
+    # cluster>1 multicasts weight tiles across cluster CTAs, which requires every cluster to
+    # be single-expert: pad each expert's run to block_m*bpc*cluster rows (same mechanism as
+    # the bpc padding, one factor stronger)
+    routing = make_routing(topk_ids, block_m, E, args.bpc * (args.cluster if args.cluster == 2 else 1))
     out = torch.zeros_like(x)
     state = {
         'sorted_token_ids': routing['sorted_token_ids'],
@@ -367,6 +376,7 @@ def run_one(dtype: str, num_tokens: int, args: argparse.Namespace) -> dict:
         'stages': args.stages,
         'bpc': args.bpc,
         'cpc': args.cpc,
+        'cluster': args.cluster,
     }
 
     if dtype == 'bf16':
@@ -556,6 +566,7 @@ def main() -> None:
     p.add_argument('--stages', type=int, default=4)
     p.add_argument('--bpc', type=int, default=1)
     p.add_argument('--cpc', type=int, default=1, help='bf16 only: intermediate 128-col groups per CTA, cuts the down-projection split-K factor by this much')
+    p.add_argument('--cluster', type=int, default=1, choices=[1, 8], help='1 = single fused kernel (best below ~4k tokens), 8 = split pipeline (act materialized once, split-K reds /8; best at >=4k tokens)')
     p.add_argument('--iters', type=int, default=50)
     p.add_argument('--warmup', type=int, default=10)
     p.add_argument('--seed', type=int, default=0)

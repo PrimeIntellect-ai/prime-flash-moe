@@ -23,6 +23,14 @@ dev = [
   "matplotlib"
 ]
 
+[tool.uv]
+# prime_moe's CUDAExtension links against the torch that is present at build time.
+# uv's default isolated build env resolves its own "torch" (per build-system.requires)
+# instead of reusing the project's installed torch, which can pull a different build
+# and break the ABI the compiled _C.so expects at import time. Force it to reuse the
+# already-installed interpreter env instead.
+no-build-isolation-package = ["prime_moe"]
+
 [tool.ruff]
 line-length = 150
 exclude = [
