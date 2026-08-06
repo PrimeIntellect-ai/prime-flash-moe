@@ -249,7 +249,7 @@ namespace pi {
                                     dst[e] = __float2bfloat16(swiglu(gate[(i<<3)+e], up[(i<<3)+e]));
                             }
                             if constexpr (SPLIT_UP) {
-                                con_sync();
+                                asm volatile("bar.sync 2, 128;\n");
                                 if (warp_id == 0 && lane_id == 0) {
                                     cuda::ptx::fence_proxy_async(cuda::ptx::space_shared);
                                     cp_async_extra::store3d(&map_act, smem_down.x+((c32<<2)*BM<<3), 0, block_base*BM, bx_col*(TC_N>>4)+(c32<<2));

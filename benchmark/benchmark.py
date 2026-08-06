@@ -404,6 +404,9 @@ def approx_flops(num_tokens: int, top_k: int, K: int, N: int) -> float:
 def run_one(dtype: str, num_tokens: int, args: argparse.Namespace) -> dict:
     E, K, N, top_k = args.experts, args.hidden, 2 * args.inter, args.top_k
     block_m = args.block_m
+    # measured dispatch policy (B200): the bf16 split pipeline beats the fused kernel at every
+    # size; the mxfp8 split only pays for its act round-trip once the batch is large enough
+    cluster = args.cluster if args.cluster is not None else (8 if dtype == 'bf16' or num_tokens >= 4096 else 1)
     torch.manual_seed(args.seed)
 
     x = torch.empty((num_tokens, K), dtype=torch.bfloat16, device='cuda').normal_(0, 0.05)
@@ -415,7 +418,7 @@ def run_one(dtype: str, num_tokens: int, args: argparse.Namespace) -> dict:
     # cluster>1 multicasts weight tiles across cluster CTAs, which requires every cluster to
     # be single-expert: pad each expert's run to block_m*bpc*cluster rows (same mechanism as
     # the bpc padding, one factor stronger)
-    routing = make_routing(topk_ids, block_m, E, args.bpc * (args.cluster if args.cluster == 2 else 1))
+    routing = make_routing(topk_ids, block_m, E, args.bpc)
     out = torch.zeros_like(x)
     state = {
         'sorted_token_ids': routing['sorted_token_ids'],
@@ -430,7 +433,7 @@ def run_one(dtype: str, num_tokens: int, args: argparse.Namespace) -> dict:
         'stages': args.stages,
         'bpc': args.bpc,
         'cpc': args.cpc,
-        'cluster': args.cluster,
+        'cluster': cluster,
     }
 
     if dtype == 'bf16':
@@ -611,18 +614,19 @@ def plot_dtype(dtype: str, rows: list[dict], path: str, subtitle: str) -> None:
     ax1.yaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(lambda v, _: f'{v:g}'))
     ax1.set_xlim(-0.35, len(xs) - 1 + 0.75)
     ax1.set_title('median latency (ms, log scale)', fontsize=10.5, color=INK, loc='left', pad=10)
-    # selective direct labels: the value at the last point, identity comes from the legend
+    # selective direct labels: the value at the last point, identity comes from the legend;
+    # the three series converge at 64k, so dodge the labels vertically to keep them apart
     if have_naive:
         ax1.annotate(
-            f'{naive[-1]:.2f} ms', (xs[-1], naive[-1]), textcoords='offset points', xytext=(7, 3),
+            f'{naive[-1]:.2f} ms', (xs[-1], naive[-1]), textcoords='offset points', xytext=(7, 14),
             ha='left', fontsize=9, color=INK,
         )
     ax1.annotate(
-        f'{base[-1]:.2f} ms', (xs[-1], base[-1]), textcoords='offset points', xytext=(7, 3),
+        f'{base[-1]:.2f} ms', (xs[-1], base[-1]), textcoords='offset points', xytext=(7, 2),
         ha='left', fontsize=9, color=INK,
     )
     ax1.annotate(
-        f'{fused[-1]:.2f} ms', (xs[-1], fused[-1]), textcoords='offset points', xytext=(7, -10),
+        f'{fused[-1]:.2f} ms', (xs[-1], fused[-1]), textcoords='offset points', xytext=(7, -12),
         ha='left', fontsize=9, color=INK,
     )
     leg = ax1.legend(frameon=False, fontsize=9, labelcolor=INK_SOFT, loc='upper left')
@@ -667,7 +671,7 @@ def write_csv(rows: list[dict], path: str) -> None:
 @torch.no_grad()
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument('--tokens', type=int, nargs='+', default=[1024, 2048, 4096, 8192, 16384, 32768, 65536])
+    p.add_argument('--tokens', type=int, nargs='+', default=[4096, 8192, 16384, 32768, 65536, 2*65536])
     p.add_argument('--dtypes', nargs='+', choices=['bf16', 'mxfp8'], default=['bf16', 'mxfp8'])
     p.add_argument('--experts', type=int, default=32)
     p.add_argument('--top-k', type=int, default=4)
@@ -675,12 +679,16 @@ def main() -> None:
     p.add_argument('--inter', type=int, default=1024, help='per expert intermediate dim H; w1 has N = 2H rows')
     p.add_argument('--balancedness', type=float, default=1.0, help='1.0 = uniform routing, 0.0 = everything to expert 0')
     p.add_argument('--block-m', type=int, default=128)
-    p.add_argument('--bn', type=int, default=32)
-    p.add_argument('--wn', type=int, default=8)
-    p.add_argument('--stages', type=int, default=4)
+    p.add_argument('--bn', type=int, default=64)
+    p.add_argument('--wn', type=int, default=4)
+    p.add_argument('--stages', type=int, default=2)
     p.add_argument('--bpc', type=int, default=1)
     p.add_argument('--cpc', type=int, default=1, help='bf16 only: intermediate 128-col groups per CTA, cuts the down-projection split-K factor by this much')
-    p.add_argument('--cluster', type=int, default=1, choices=[1, 8], help='1 = single fused kernel (best below ~4k tokens), 8 = split pipeline (act materialized once, split-K reds /8; best at >=4k tokens)')
+    p.add_argument(
+        '--cluster', type=int, default=None, choices=[1, 8],
+        help='1 = single fused kernel, 8 = split pipeline (act materialized once, split-K reds /8). '
+             'Default: auto — bf16 always uses the split pipeline; mxfp8 uses it at >=4k tokens and the fused kernel below',
+    )
     p.add_argument('--iters', type=int, default=50)
     p.add_argument('--warmup', type=int, default=10)
     p.add_argument('--seed', type=int, default=0)
