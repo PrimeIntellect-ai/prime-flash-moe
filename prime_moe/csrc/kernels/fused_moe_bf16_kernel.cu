@@ -136,11 +136,12 @@ namespace pi {
                     }
                     
                 }
-                if (threadIdx.x < 32) {
+                if constexpr (SPLIT_UP) {
+                    if (!threadIdx.x)
+                        cp_async::load(smem_up.x+smem_stage*XS, &map_x, *bar_copy[smem_stage], offs, block_base*BM);
+                } else if (threadIdx.x < 32) {
                     cp_async::gather4(
-                    g4_dst + static_cast<uint32_t>(smem_stage*XS*sizeof(__nv_bfloat16)),
-                                      &map_x, *bar_copy[smem_stage], offs,
-                                      g4_rows[0], g4_rows[1], g4_rows[2], g4_rows[3]);
+                    g4_dst + static_cast<uint32_t>(smem_stage*XS*sizeof(__nv_bfloat16)), &map_x, *bar_copy[smem_stage], offs, g4_rows[0], g4_rows[1], g4_rows[2], g4_rows[3]);
                 }
                 bar_copy[smem_stage].arrive_cp_async_mem();
                 ++smem_stage;
@@ -194,6 +195,7 @@ namespace pi {
             auto &smem_down = *reinterpret_cast<smem_down_pod<STAGES, WN, BM, BK, BN, BPC, CPC> *>(smem_raw);
             if (warp_id == 0 && lane_id == 0) {
                 int smem_stage = 0;
+                int pend_slot = -1, pend_phase = 0;
                 for (int i=0; i < STAGES; ++i) recycle_arrive(i);
                 for (int stage=0; stage < n_stages_up; ++stage) {
                     if (smem_stage == STAGES) {
@@ -217,16 +219,19 @@ namespace pi {
                             }
                         }
                     }
+                    tcgen05::commit_mbarrier(*bar_recycle[smem_stage]);
                     tcgen05::commit_mbarrier(*bar_mma[smem_stage]);
-                    bar_mma[smem_stage].await(phase);
-                    recycle_arrive(smem_stage);
+                    pend_slot = smem_stage;
+                    pend_phase = phase;
                     ++smem_stage;
                 }
+                bar_mma[pend_slot].await(pend_phase);
             }
             int smem_stage = n_stages_up % STAGES;
             phase = (n_stages_up / STAGES) & 1;
             con_sync();
             tcgen05::after_thread_sync();
+            auto *act_smem = SPLIT_UP ? reinterpret_cast<__nv_bfloat16 *>(smem_raw) : smem_down.x;
             if (warp_id < 4) {
                 #pragma unroll
                 for (int b = 0; b < BPC; ++b) {
@@ -243,18 +248,18 @@ namespace pi {
                             tcgen05::await_ld();
                             #pragma unroll
                             for (int i=0; i < 4; ++i) {
-                                auto *dst = smem_down.x+slot*DXS+((((c32<<2)+i)*BM+tmem_row)<<3);
+                                auto *dst = act_smem+slot*DXS+((((c32<<2)+i)*BM+tmem_row)<<3);
                                 #pragma unroll
                                 for (int e=0; e < 8; ++e)
                                     dst[e] = __float2bfloat16(swiglu(gate[(i<<3)+e], up[(i<<3)+e]));
                             }
-                            if constexpr (SPLIT_UP) {
-                                asm volatile("bar.sync 2, 128;\n");
-                                if (warp_id == 0 && lane_id == 0) {
-                                    cuda::ptx::fence_proxy_async(cuda::ptx::space_shared);
-                                    cp_async_extra::store3d(&map_act, smem_down.x+((c32<<2)*BM<<3), 0, block_base*BM, bx_col*(TC_N>>4)+(c32<<2));
-                                    cuda::ptx::cp_async_bulk_commit_group();
-                                }
+                        }
+                        if constexpr (SPLIT_UP) {
+                            asm volatile("bar.sync 2, 128;\n");
+                            if (warp_id == 0 && lane_id == 0) {
+                                cuda::ptx::fence_proxy_async(cuda::ptx::space_shared);
+                                cp_async_extra::store3d(&map_act, act_smem, 0, block_base*BM, bx_col*(TC_N>>4));
+                                cuda::ptx::cp_async_bulk_commit_group();
                             }
                         }
                     }
@@ -367,8 +372,26 @@ namespace pi {
         else consumer();
     }
 
-    template <int BM, int CK, int TCN, int STAGES, int PRODUCER_THREADS>
-    static __global__ __launch_bounds__(128+PRODUCER_THREADS, 2) void fused_moe_down_kernel(
+    static __global__ void gather_x_kernel(
+        const __nv_bfloat16 *__restrict__ x,
+        __nv_bfloat16 *__restrict__ x_sorted,
+        const int32_t *__restrict__ sorted_token_ids,
+        const int32_t *__restrict__ num_tokens_post_padded,
+        int32_t top_k,
+        int K
+    ) {
+        int row = static_cast<int>(blockIdx.x)*(blockDim.x>>5) + (static_cast<int>(threadIdx.x)>>5);
+        if (row >= *num_tokens_post_padded) return;
+        int tdest = sorted_token_ids[row];
+        int tok = tdest >= 0 ? tdest/top_k : 0;
+        auto *src = reinterpret_cast<const uint4 *>(x) + (static_cast<int64_t>(tok)*K>>3);
+        auto *dst = reinterpret_cast<uint4 *>(x_sorted) + (static_cast<int64_t>(row)*K>>3);
+        for (int i=static_cast<int>(threadIdx.x)&31; i < K>>3; i += 32)
+            dst[i] = __ldg(src+i);
+    }
+
+    template <int BM, int CK, int TCN, int STAGES, int PRODUCER_THREADS, int PAIR>
+    static __global__ __launch_bounds__(128+PRODUCER_THREADS, PAIR > 1 ? 1 : 2) void fused_moe_down_kernel(
         const __grid_constant__ CUtensorMap map_act,
         const __grid_constant__ CUtensorMap map_w2d,
         __nv_bfloat16 *__restrict__ out,
@@ -382,10 +405,10 @@ namespace pi {
         int H
     ) {
         static constexpr int WSD = TCN*CK;   // w2 elems per stage
-        static constexpr int XSD = BM*CK;    // act elems per stage
+        static constexpr int XSD = BM*CK;    // act elems per block and stage
         struct pod_t {
             alignas(1024) __nv_bfloat16 w[STAGES*WSD];
-            alignas(1024) __nv_bfloat16 x[STAGES*XSD];
+            alignas(1024) __nv_bfloat16 x[STAGES*PAIR*XSD];
         };
         alignas(1024) extern __shared__ uint8_t smem_raw[];
         auto &smem = *reinterpret_cast<pod_t *>(smem_raw);
@@ -393,13 +416,17 @@ namespace pi {
         alignas(8) __shared__ barrier bar_recycle[STAGES];
         alignas(8) __shared__ barrier bar_mma[STAGES];
         alignas(4) __shared__ uint32_t tmem_acc;
-        __shared__ __nv_bfloat16 topk_scales[BM];
-        __shared__ int32_t row_tok[BM];
+        __shared__ __nv_bfloat16 topk_scales[BM*PAIR];
+        __shared__ int32_t row_tok[BM*PAIR];
 
         const int by_row = static_cast<int>(blockIdx.y);
         const int bx_col = static_cast<int>(blockIdx.x);
-        if (BM*by_row >= *num_tokens_post_padded) return;
-        int expert_idx = expert_idxs[by_row];
+        int total_padded = *num_tokens_post_padded;
+        int rb0 = by_row*PAIR;
+        if (BM*rb0 >= total_padded) return;
+        int nb = min(PAIR, total_padded/BM - rb0);
+        int expert0 = expert_idxs[rb0];
+        bool same = nb < 2 || expert0 == expert_idxs[rb0+1];
         int lane_id = threadIdx.x&31;
         bool is_prod = threadIdx.x < PRODUCER_THREADS;
         int warp_id = (is_prod ? threadIdx.x : threadIdx.x-PRODUCER_THREADS) >> 5;
@@ -413,27 +440,48 @@ namespace pi {
         }
         __syncthreads();
         if (threadIdx.x >= PRODUCER_THREADS && threadIdx.x < PRODUCER_THREADS+32)
-            tcgen05::tmem_alloc(&tmem_acc, TCN);
+            tcgen05::tmem_alloc(&tmem_acc, TCN*PAIR);
         __syncthreads();
-        for (int r = threadIdx.x; r < BM; r += blockDim.x) {
-            int tdest = sorted_token_ids[by_row*BM+r];
+        for (int r = threadIdx.x; r < BM*nb; r += blockDim.x) {
+            int tdest = sorted_token_ids[rb0*BM+r];
             row_tok[r] = tdest >= 0 ? tdest / top_k : -1;
             if (tdest >= 0 && row_tok[r] < M) topk_scales[r] = __float2bfloat16(topk_weights[tdest]);
         }
         __syncthreads();
         int n_stages = H / CK;
+        int total_stages = same ? n_stages : nb*n_stages;
         if (is_prod) {
+            int pre = min(STAGES, total_stages);
+            for (int s=0; s < pre; ++s) {
+                bar_recycle[s].await(0);
+                if (!threadIdx.x) {
+                    int p = same ? 0 : s/n_stages, ks = same ? s : s%n_stages;
+                    int nact = same ? nb : 1;
+                    bar_copy[s].expect_nb((WSD+nact*XSD)*sizeof(__nv_bfloat16));
+                    cp_async::load3d(smem.w+s*WSD, &map_w2d, *bar_copy[s], ks*CK, expert_idxs[rb0+p]*K+bx_col*TCN, 0);
+                }
+            }
             cudaGridDependencySynchronize();
             int smem_stage = 0, phase = 0;
-            for (int stage=0; stage < n_stages; ++stage) {
+            for (int stage=0; stage < total_stages; ++stage) {
                 if (smem_stage == STAGES) { phase^=1; smem_stage = 0; }
-                bar_recycle[smem_stage].await(phase);
+                int p = same ? 0 : stage/n_stages, ks = same ? stage : stage%n_stages;
+                if (stage >= pre) {
+                    bar_recycle[smem_stage].await(phase);
+                    if (!threadIdx.x) {
+                        int nact = same ? nb : 1;
+                        bar_copy[smem_stage].expect_nb((WSD+nact*XSD)*sizeof(__nv_bfloat16));
+                        cp_async::load3d(smem.w+smem_stage*WSD, &map_w2d, *bar_copy[smem_stage],
+                                         ks*CK, expert_idxs[rb0+p]*K+bx_col*TCN, 0);
+                    }
+                }
                 if (!threadIdx.x) {
-                    bar_copy[smem_stage].expect_nb((WSD+XSD)*sizeof(__nv_bfloat16));
-                    cp_async::load3d(smem.w+smem_stage*WSD, &map_w2d, *bar_copy[smem_stage],
-                                     stage*CK, expert_idx*K+bx_col*TCN, 0);
-                    cp_async::load3d(smem.x+smem_stage*XSD, &map_act, *bar_copy[smem_stage],
-                                     0, by_row*BM, stage*(CK>>3));
+                    if (same) {
+                        for (int b=0; b < nb; ++b)
+                            cp_async::load(smem.x+(smem_stage*PAIR+b)*XSD, &map_act, *bar_copy[smem_stage], ks*CK, (rb0+b)*BM);
+                    } else {
+                        cp_async::load(smem.x+smem_stage*PAIR*XSD, &map_act, *bar_copy[smem_stage], ks*CK, (rb0+p)*BM);
+                    }
                 }
                 bar_copy[smem_stage].arrive_cp_async_mem();
                 ++smem_stage;
@@ -444,53 +492,57 @@ namespace pi {
         uint32_t idesc = tcgen05::encode_idesc_format_1(BM, TCN);
         if (warp_id == 0 && lane_id == 0) {
             int smem_stage = 0, phase = 0;
-            int pend_slot = -1, pend_phase = 0;
             for (int i=0; i < STAGES; ++i) bar_recycle[i].arrive();
-            for (int stage=0; stage < n_stages; ++stage) {
+            for (int stage=0; stage < total_stages; ++stage) {
                 if (smem_stage == STAGES) { phase^=1; smem_stage = 0; }
+                int p = same ? 0 : stage/n_stages, ks = same ? stage : stage%n_stages;
                 bar_copy[smem_stage].await(phase);
                 #pragma unroll
                 for (int k16=0; k16 < CK>>4; ++k16) {
-                    auto *__restrict__ a_ptr = smem.x+smem_stage*XSD+((k16*BM)<<4);
                     auto *__restrict__ b_ptr = smem.w+smem_stage*WSD+(k16<<4);
-                    uint64_t a_desc = tcgen05::encode_smem_desc(a_ptr, BM);
                     uint64_t b_desc = tcgen05::encode_smem_desc_swz<CK*2>(b_ptr);
-                    tcgen05::mma_f16(tmem_acc, a_desc, b_desc, idesc, stage||k16);
+                    if (same) {
+                        for (int b=0; b < nb; ++b) {
+                            auto *__restrict__ a_ptr = smem.x+(smem_stage*PAIR+b)*XSD+(k16<<4);
+                            uint64_t a_desc = tcgen05::encode_smem_desc_swz<CK*2>(a_ptr);
+                            tcgen05::mma_f16(tmem_acc+b*TCN, a_desc, b_desc, idesc, ks||k16);
+                        }
+                    } else {
+                        auto *__restrict__ a_ptr = smem.x+smem_stage*PAIR*XSD+(k16<<4);
+                        uint64_t a_desc = tcgen05::encode_smem_desc_swz<CK*2>(a_ptr);
+                        tcgen05::mma_f16(tmem_acc+p*TCN, a_desc, b_desc, idesc, ks||k16);
+                    }
                 }
-                tcgen05::commit_mbarrier(*bar_mma[smem_stage]);
-                if (pend_slot >= 0) {
-                    bar_mma[pend_slot].await(pend_phase);
-                    bar_recycle[pend_slot].arrive();
-                }
-                pend_slot = smem_stage;
-                pend_phase = phase;
+                tcgen05::commit_mbarrier(*bar_recycle[smem_stage]);
                 ++smem_stage;
             }
-            bar_mma[pend_slot].await(pend_phase);
-            bar_recycle[pend_slot].arrive();
+            tcgen05::commit_mbarrier(*bar_mma[0]);
+            bar_mma[0].await(0);
         }
         asm volatile ("bar.sync 1, 128;\n");
         tcgen05::after_thread_sync();
         if (warp_id < 4) {
-            float scale = __bfloat162float(topk_scales[tmem_row]);
-            int tok = row_tok[tmem_row];
-            bool row_valid = tok >= 0 && tok < M;
-            __nv_bfloat16 *gdst = out+(row_valid ? tok : 0)*K+bx_col*TCN;
-            #pragma unroll
-            for (int c32=0; c32 < TCN>>5; ++c32) {
-                float vals[32];
-                tcgen05::ld_32x32b_x32(vals, tcgen05::tmem_addr(tmem_acc, tmem_row, c32<<5));
-                tcgen05::await_ld();
-                if (row_valid) {
-                    #pragma unroll
-                    for (int i=0; i < 4; ++i)
-                        red_global_add_bf16x8(gdst+(((c32<<2)+i)<<3), vals+(i<<3), scale);
+            for (int b=0; b < nb; ++b) {
+                float scale = __bfloat162float(topk_scales[b*BM+tmem_row]);
+                int tok = row_tok[b*BM+tmem_row];
+                bool row_valid = tok >= 0 && tok < M;
+                __nv_bfloat16 *gdst = out+(row_valid ? tok : 0)*K+bx_col*TCN;
+                #pragma unroll
+                for (int c32=0; c32 < TCN>>5; ++c32) {
+                    float vals[32];
+                    tcgen05::ld_32x32b_x32(vals, tcgen05::tmem_addr(tmem_acc+b*TCN, tmem_row, c32<<5));
+                    tcgen05::await_ld();
+                    if (row_valid) {
+                        #pragma unroll
+                        for (int i=0; i < 4; ++i)
+                            red_global_add_bf16x8(gdst+(((c32<<2)+i)<<3), vals+(i<<3), scale);
+                    }
                 }
             }
         }
         asm volatile ("bar.sync 1, 128;\n");
         if (threadIdx.x >= PRODUCER_THREADS && threadIdx.x < PRODUCER_THREADS+32)
-            tcgen05::tmem_free(tmem_acc, TCN);
+            tcgen05::tmem_free(tmem_acc, TCN*PAIR);
     }
 
 
@@ -513,13 +565,15 @@ namespace pi {
         int block_m,
         cudaStream_t stream
     ) {
-        static constexpr auto BK = (CPC > 1) ? 32 : 64;
         static constexpr auto PRODUCER_THREADS = 32;
         static constexpr bool SP = SPLIT && BPC == 1 && CPC == 1 && STAGES <= 4;
-        static constexpr size_t SMEM = std::max(
-            sizeof(smem_up_pod<STAGES, WN, BM, BK, BN, BPC, CPC>),
-            sizeof(smem_down_pod<STAGES, WN, BM, BK, BN, BPC, CPC>)
-        );
+        static constexpr auto BK = (CPC > 1) ? 32 : 64;
+        static constexpr size_t SMEM = SP
+            ? sizeof(smem_up_pod<STAGES, WN, BM, BK, BN, BPC, CPC>)
+            : std::max(
+                sizeof(smem_up_pod<STAGES, WN, BM, BK, BN, BPC, CPC>),
+                sizeof(smem_down_pod<STAGES, WN, BM, BK, BN, BPC, CPC>)
+            );
         if ((N/(BN*WN)) % CPC)
             throw std::runtime_error {"cpc="+std::to_string(CPC)+" must divide N/256 ("+std::to_string(N/(BN*WN))+") evenly"};
         dim3 block = {(WN<<5)+PRODUCER_THREADS, 1, 1};
@@ -546,11 +600,13 @@ namespace pi {
         );
         const uint64_t HD = static_cast<uint64_t>(N) >> 1;
         __nv_bfloat16 *act_ws = nullptr;
+        __nv_bfloat16 *x_sorted = nullptr;
         if (SPLIT && !SP)
             throw std::runtime_error {"split pipeline requires stages<=4, bpc=1, cpc=1"};
         if constexpr (SP) {
-            if (cudaMallocAsync(&act_ws, static_cast<size_t>(sorted_num)*HD*sizeof(__nv_bfloat16), stream) != cudaSuccess)
+            if (cudaMallocAsync(&act_ws, static_cast<size_t>(sorted_num)*(HD+K)*sizeof(__nv_bfloat16), stream) != cudaSuccess)
                 throw std::runtime_error {"failed to allocate the split-pipeline act workspace"};
+            x_sorted = act_ws + static_cast<size_t>(sorted_num)*HD;
             if (!g_zstream) {
                 cudaStreamCreateWithFlags(&g_zstream, cudaStreamNonBlocking);
                 cudaEventCreateWithFlags(&g_e_head, cudaEventDisableTiming);
@@ -567,17 +623,17 @@ namespace pi {
             SP ? act_ws : reinterpret_cast<__nv_bfloat16 *>(out),
             {8ull, static_cast<uint64_t>(sorted_num), HD>>3},
             {HD*sizeof(__nv_bfloat16), 8ull*sizeof(__nv_bfloat16)},
-            {8u, static_cast<uint32_t>(BM), 4u},
+            {8u, static_cast<uint32_t>(BM), 16u},
             {1u, 1u, 1u},
             CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE
         );
         CUtensorMap map_x = init_tmap<2>(
             "x",
             CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
-            x,
-            {static_cast<uint64_t>(K), static_cast<uint64_t>(M)},
+            SP ? x_sorted : x,
+            {static_cast<uint64_t>(K), SP ? static_cast<uint64_t>(sorted_num) : static_cast<uint64_t>(M)},
             {static_cast<uint64_t>(K)*sizeof(__nv_bfloat16)},
-            {static_cast<uint32_t>(BK), 1u},
+            {static_cast<uint32_t>(BK), SP ? 128u : 1u},
             {1u, 1u},
             BK == 64 ? CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B
                      : CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_64B
@@ -592,6 +648,12 @@ namespace pi {
             {1u, 1u, 1u},
             CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B
         );
+        if constexpr (SP) {
+            gather_x_kernel<<<(sorted_num+7)/8, 256, 0, stream>>>(
+                x, x_sorted, sorted_token_ids, num_tokens_post_padded,
+                static_cast<int32_t>(top_k), K
+            );
+        }
         {
             kernel<<<grid, block, SMEM, stream>>>(
                 x,
@@ -614,17 +676,19 @@ namespace pi {
         if constexpr (SP) {
             static constexpr int TCN = 256;
             static constexpr int CK = 64;
-            static constexpr int DSTAGES = 2;
+            static constexpr int DSTAGES = 3;
             static constexpr int DPROD = 32;
-            CUtensorMap map_act_ld = init_tmap<3>(
+            static constexpr int DPAIR = 2;
+            CUtensorMap map_act_ld = init_tmap<2>(
                 "act_ld",
                 CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
                 act_ws,
-                {8ull, static_cast<uint64_t>(sorted_num), HD>>3},
-                {HD*sizeof(__nv_bfloat16), 8ull*sizeof(__nv_bfloat16)},
-                {8u, static_cast<uint32_t>(BM), CK>>3},
-                {1u, 1u, 1u},
-                CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE
+                {HD, static_cast<uint64_t>(sorted_num)},
+                {HD*sizeof(__nv_bfloat16)},
+                {static_cast<uint32_t>(CK), static_cast<uint32_t>(BM)},
+                {1u, 1u},
+                CK == 64 ? CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B
+                         : CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_64B
             );
             constexpr auto DW_SWZ = CK == 64 ? CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B
                                              : CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_64B;
@@ -639,11 +703,11 @@ namespace pi {
                 DW_SWZ
             );
             cudaStreamWaitEvent(stream, g_e_zero, 0);   // out zeroed before the down reds
-            auto *dkernel = fused_moe_down_kernel<BM, CK, TCN, DSTAGES, DPROD>;
-            static constexpr size_t DSMEM_SZ = DSTAGES*(TCN*CK + BM*CK)*sizeof(__nv_bfloat16);
+            auto *dkernel = fused_moe_down_kernel<BM, CK, TCN, DSTAGES, DPROD, DPAIR>;
+            static constexpr size_t DSMEM_SZ = DSTAGES*(TCN*CK + DPAIR*BM*CK)*sizeof(__nv_bfloat16);
             if (cudaFuncSetAttribute(dkernel, cudaFuncAttributeMaxDynamicSharedMemorySize, DSMEM_SZ) != cudaSuccess)
                 throw std::runtime_error {"failed to set smem for fused_moe_down_kernel"};
-            dim3 dgrid = {static_cast<uint32_t>(K/TCN), static_cast<uint32_t>(sorted_num/BM), 1};
+            dim3 dgrid = {static_cast<uint32_t>(K/TCN), static_cast<uint32_t>((sorted_num/BM+DPAIR-1)/DPAIR), 1};
             dim3 dblock = {128+DPROD, 1, 1};
             cudaLaunchConfig_t dcfg = {};
             dcfg.gridDim = dgrid;

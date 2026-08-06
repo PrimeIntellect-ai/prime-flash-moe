@@ -50,7 +50,7 @@ from torch.nn.functional import ScalingType, SwizzleType, scaled_mm
 
 try:
     import prime_moe
-    from prime_moe.mxfp8 import pack_scales_blocked
+    from prime_moe import pack_scales_blocked
 
     HAVE_KERNEL = True
     KERNEL_IMPORT_ERROR = None
@@ -362,7 +362,10 @@ def approx_flops(num_tokens: int, top_k: int, K: int, N: int) -> float:
 def run_one(dtype: str, num_tokens: int, args: argparse.Namespace) -> dict:
     E, K, N, top_k = args.experts, args.hidden, 2 * args.inter, args.top_k
     block_m = args.block_m
-    cluster = args.cluster if args.cluster is not None else (8 if dtype == 'bf16' or num_tokens >= 4096 else 1)
+    cluster = args.cluster if args.cluster is not None else 8  # the split pipeline wins at every size for both dtypes
+    # mxfp8 runs 1 CTA/SM (tmem-capped), so it profits from a deeper ring; bf16 needs
+    # the shallow ring to keep 2 CTAs/SM
+    stages = args.stages if args.stages is not None else (4 if dtype == 'mxfp8' and cluster == 8 else 2)
     torch.manual_seed(args.seed)
 
     x = torch.empty((num_tokens, K), dtype=torch.bfloat16, device='cuda').normal_(0, 0.05)
@@ -386,7 +389,7 @@ def run_one(dtype: str, num_tokens: int, args: argparse.Namespace) -> dict:
         'block_m': block_m,
         'bn': args.bn,
         'wn': args.wn,
-        'stages': args.stages,
+        'stages': stages,
         'bpc': args.bpc,
         'cpc': args.cpc,
         'cluster': cluster,
@@ -633,13 +636,13 @@ def main() -> None:
     p.add_argument('--block-m', type=int, default=128)
     p.add_argument('--bn', type=int, default=64)
     p.add_argument('--wn', type=int, default=4)
-    p.add_argument('--stages', type=int, default=2)
+    p.add_argument('--stages', type=int, default=None, help='pipeline ring depth; default: 2 for bf16, 4 for the mxfp8 split pipeline')
     p.add_argument('--bpc', type=int, default=1)
     p.add_argument('--cpc', type=int, default=1, help='bf16 only: intermediate 128-col groups per CTA, cuts the down-projection split-K factor by this much')
     p.add_argument(
         '--cluster', type=int, default=None, choices=[1, 8],
         help='1 = single fused kernel, 8 = split pipeline (act materialized once, split-K reds /8). '
-             'Default: auto — bf16 always uses the split pipeline; mxfp8 uses it at >=4k tokens and the fused kernel below',
+             'Default: 8 — the split pipeline wins at every token count for both dtypes',
     )
     p.add_argument('--iters', type=int, default=50)
     p.add_argument('--warmup', type=int, default=10)

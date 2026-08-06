@@ -53,10 +53,38 @@ namespace pi {
     static_assert(mxfp8_pod_alias<4, 8, 128, 128, 32>);
     static_assert(mxfp8_pod_alias<4, 4, 128, 128, 64>);
 
+    static __global__ void gather_x_mxfp8_kernel(
+        const __nv_fp8_e4m3 *__restrict__ x,
+        const uint8_t *__restrict__ x_scales,
+        __nv_fp8_e4m3 *__restrict__ x_sorted,
+        uint8_t *__restrict__ xsf_tiles,
+        const int32_t *__restrict__ sorted_token_ids,
+        const int32_t *__restrict__ num_tokens_post_padded,
+        int32_t top_k,
+        int K
+    ) {
+        int row = static_cast<int>(blockIdx.x)*(blockDim.x>>5) + (static_cast<int>(threadIdx.x)>>5);
+        if (row >= *num_tokens_post_padded) return;
+        int tdest = sorted_token_ids[row];
+        int tok = tdest >= 0 ? tdest/top_k : 0;
+        int lane = threadIdx.x&31;
+        auto *src = reinterpret_cast<const uint4 *>(x) + (static_cast<int64_t>(tok)*K>>4);
+        auto *dst = reinterpret_cast<uint4 *>(x_sorted) + (static_cast<int64_t>(row)*K>>4);
+        for (int i=lane; i < K>>4; i += 32)
+            dst[i] = __ldg(src+i);
+        int r = row&127;
+        for (int kt=lane; kt < K>>7; kt += 32) {
+            uint32_t sf4 = *reinterpret_cast<const uint32_t *>(x_scales + static_cast<int64_t>(tok)*(K>>5) + (kt<<2));
+            *reinterpret_cast<uint32_t *>(xsf_tiles + ((static_cast<size_t>(row>>7)*(K>>7)+kt)<<9) + ((r&31)<<4) + ((r>>5)<<2)) = sf4;
+        }
+    }
+
     template <int BM, int BK, int BN, int WN, int STAGES, int PRODUCER_THREADS, bool SPLIT_UP = false>
     static __global__ __launch_bounds__(WN*32 + PRODUCER_THREADS) void fused_moe_mxfp8_kernel(
         const __nv_fp8_e4m3 *__restrict__ x,
         const uint8_t *__restrict__ x_scales,
+        const __grid_constant__ CUtensorMap map_x,
+        const uint8_t *__restrict__ xsf_tiles,
         const __grid_constant__ CUtensorMap map_w,
         const uint8_t *__restrict__ w_scales,
         const __grid_constant__ CUtensorMap map_w2,
@@ -114,7 +142,7 @@ namespace pi {
         if (!threadIdx.x) {
             for (int i = 0; i < STAGES; ++i) {
                 bar_copy[i].init(PRODUCER_THREADS+1);
-                bar_recycle[i].init(CONSUMER_THREADS);
+                bar_recycle[i].init(SPLIT_UP ? 1 : CONSUMER_THREADS);
                 bar_mma[i].init(1);
             }
             asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
@@ -154,6 +182,13 @@ namespace pi {
                 }
                 int offs = stage*BK;
                 bar_recycle[smem_stage].await(phase);
+                if constexpr (SPLIT_UP) {
+                    for (int i=threadIdx.x; i < SFT>>3; i += PRODUCER_THREADS)
+                        cp_async::cg64<8>(
+                            static_cast<uint32_t>(__cvta_generic_to_shared(smem_up.sfx+smem_stage*SFT+(i<<3))),
+                            xsf_tiles + (static_cast<size_t>(block_base)*(K>>7) + stage)*SFT + (i<<3)
+                        );
+                } else {
                 for (int wave=0; wave < BM/ROWS_PER_WAVE; ++wave) {
                     int r = wave*ROWS_PER_WAVE+(threadIdx.x/CHUNKS_PER_ROW);
                     int k16 = threadIdx.x&(CHUNKS_PER_ROW-1);
@@ -174,6 +209,7 @@ namespace pi {
                         x_scales+static_cast<int64_t>(tok)*(K>>5)+(offs>>5)
                     );
                 }
+                }
                 for (int i=threadIdx.x; i < SFW_CHUNKS; i += PRODUCER_THREADS) {
                     int j = i/(SFT>>3);
                     int o = (i-j*(SFT>>3))<<3;
@@ -187,17 +223,18 @@ namespace pi {
                 }
                 bar_copy[smem_stage].arrive_cp_async_mem();
                 if (!threadIdx.x) {
-                    bar_copy[smem_stage].expect_nb(WS*sizeof(__nv_fp8_e4m3));
-                    cp_async::load5d(
+                    bar_copy[smem_stage].expect_nb((WS + (SPLIT_UP ? XS : 0))*sizeof(__nv_fp8_e4m3));
+                    cp_async::load4d(
                         smem_up.w+smem_stage*WS,
                         &map_w,
                         *bar_copy[smem_stage],
-                        0,
+                        offs,
                         0,
                         expert_idx<<1,
-                        blockIdx.x*(TC_N>>8),
-                        offs>>4
+                        blockIdx.x
                     );
+                    if constexpr (SPLIT_UP)
+                        cp_async::load(smem_up.x+smem_stage*XS, &map_x, *bar_copy[smem_stage], offs, block_base*BM);
                 }
                 ++smem_stage;
             }
@@ -241,9 +278,55 @@ namespace pi {
                 int32_t tdest = sorted_token_ids[block_base*BM+(threadIdx.x - PRODUCER_THREADS)];
                 if (tdest >= 0) tok_src = tdest / top_k;
             }
-            for (int i=0; i < STAGES; ++i) bar_recycle[i].arrive();
             uint32_t idesc = tcgen05::encode_idesc_block_scaled_e4m3(BM, TC_N);
             int smem_stage = 0;
+            if constexpr (SPLIT_UP) {
+                if (warp_id == 0 && lane_id == 0) {
+                    for (int i=0; i < STAGES; ++i) bar_recycle[i].arrive();
+                    for (int stage=0; stage < n_stages_up; ++stage) {
+                        if (smem_stage == STAGES) {
+                            phase^=1;
+                            smem_stage = 0;
+                        }
+                        bar_copy[smem_stage].await(phase);
+                        if (live) {
+                            uint32_t sfa = TM_SFA + ((stage&3)<<4);
+                            uint32_t sfb = sfa + 4;
+                            tcgen05::cp_sf_32x128b(
+                                tmem_acc+sfa,
+                                tcgen05::encode_sf_smem_desc(smem_up.sfx+smem_stage*SFT)
+                            );
+                            #pragma unroll
+                            for (int j=0; j < NSFW; ++j)
+                                tcgen05::cp_sf_32x128b(
+                                    tmem_acc+sfb+(j<<2),
+                                    tcgen05::encode_sf_smem_desc(smem_up.sfw+smem_stage*NSFW*SFT+j*SFT)
+                                );
+                            #pragma unroll
+                            for (int k32=0; k32 < KB; ++k32) {
+                                auto *__restrict__ a_ptr = smem_up.x+smem_stage*XS+(k32<<5);
+                                auto *__restrict__ b_ptr = smem_up.w+smem_stage*WS+(k32<<5);
+                                uint64_t a_desc = tcgen05::encode_smem_desc_swz<128>(a_ptr);
+                                uint64_t b_desc = tcgen05::encode_smem_desc_swz<128>(b_ptr);
+                                tcgen05::mma_mxf8f6f4(
+                                    tmem_acc,
+                                    a_desc,
+                                    b_desc,
+                                    tcgen05::idesc_with_sf_id(idesc, k32),
+                                    tmem_acc+sfa,
+                                    tmem_acc+sfb,
+                                    stage||k32
+                                );
+                            }
+                        }
+                        tcgen05::commit_mbarrier(*bar_recycle[smem_stage]);
+                        ++smem_stage;
+                    }
+                    tcgen05::commit_mbarrier(*bar_mma[0]);
+                    bar_mma[0].await(0);
+                }
+            } else {
+            for (int i=0; i < STAGES; ++i) bar_recycle[i].arrive();
             for (int stage=0; stage < n_stages_up; ++stage) {
                 if (smem_stage == STAGES) {
                     phase^=1;
@@ -265,9 +348,9 @@ namespace pi {
                         #pragma unroll
                         for (int k32=0; k32 < KB; ++k32) {
                             auto *__restrict__ a_ptr = smem_up.x+smem_stage*XS+k32*BM*32;
-                            auto *__restrict__ b_ptr = smem_up.w+smem_stage*WS+k32*TC_N*32;
+                            auto *__restrict__ b_ptr = smem_up.w+smem_stage*WS+(k32<<5);
                             uint64_t a_desc = tcgen05::encode_smem_desc(a_ptr, BM);
-                            uint64_t b_desc = tcgen05::encode_smem_desc(b_ptr, TC_N);
+                            uint64_t b_desc = tcgen05::encode_smem_desc_swz<128>(b_ptr);
                             tcgen05::mma_mxf8f6f4(
                                 tmem_acc,
                                 a_desc,
@@ -284,6 +367,7 @@ namespace pi {
                 bar_mma[smem_stage].await(phase);
                 bar_recycle[smem_stage].arrive();
                 ++smem_stage;
+            }
             }
             con_sync();
             tcgen05::after_thread_sync();
@@ -483,33 +567,57 @@ namespace pi {
         __syncthreads();
         int n_stages = H / CK;
         if (is_prod) {
+            // w2 and its scales do not depend on the up kernel: prefetch the first
+            // stages of both under the tail of the up grid, only the act (+ act SF)
+            // loads sit behind the sync
+            int pre = min(STAGES, n_stages);
+            for (int s=0; s < pre; ++s) {
+                bar_recycle[s].await(0);
+                for (int i=threadIdx.x; i < (NSFW*SFT)>>3; i += PRODUCER_THREADS) {
+                    int j = i/(SFT>>3);
+                    int o = (i-j*(SFT>>3))<<3;
+                    int64_t tile = (static_cast<int64_t>(expert_idx)*(K>>7) + bx_col*NSFW + j)*(H>>7) + s;
+                    cp_async::cg64<8>(
+                        static_cast<uint32_t>(__cvta_generic_to_shared(smem.sfw+s*NSFW*SFT+j*SFT+o)),
+                        w2_scales + tile*SFT + o
+                    );
+                }
+                if (!threadIdx.x) {
+                    bar_copy[s].expect_nb((WSD+XSD)*sizeof(__nv_fp8_e4m3));
+                    cp_async::load(smem.w+s*WSD, &map_w2, *bar_copy[s],
+                                   s*CK, expert_idx*K+bx_col*TCN);
+                }
+            }
             cudaGridDependencySynchronize();
             int smem_stage = 0, phase = 0;
             for (int stage=0; stage < n_stages; ++stage) {
                 if (smem_stage == STAGES) { phase^=1; smem_stage = 0; }
-                bar_recycle[smem_stage].await(phase);
+                if (stage >= pre) {
+                    bar_recycle[smem_stage].await(phase);
+                    for (int i=threadIdx.x; i < (NSFW*SFT)>>3; i += PRODUCER_THREADS) {
+                        int j = i/(SFT>>3);
+                        int o = (i-j*(SFT>>3))<<3;
+                        int64_t tile = (static_cast<int64_t>(expert_idx)*(K>>7) + bx_col*NSFW + j)*(H>>7) + stage;
+                        cp_async::cg64<8>(
+                            static_cast<uint32_t>(__cvta_generic_to_shared(smem.sfw+smem_stage*NSFW*SFT+j*SFT+o)),
+                            w2_scales + tile*SFT + o
+                        );
+                    }
+                    if (!threadIdx.x) {
+                        bar_copy[smem_stage].expect_nb((WSD+XSD)*sizeof(__nv_fp8_e4m3));
+                        cp_async::load(smem.w+smem_stage*WSD, &map_w2, *bar_copy[smem_stage],
+                                       stage*CK, expert_idx*K+bx_col*TCN);
+                    }
+                }
                 for (int i=threadIdx.x; i < SFT>>3; i += PRODUCER_THREADS)
                     cp_async::cg64<8>(
                         static_cast<uint32_t>(__cvta_generic_to_shared(smem.sfx+smem_stage*SFT+(i<<3))),
                         sf_act + (static_cast<size_t>(by_row)*n_stages + stage)*SFT + (i<<3)
                     );
-                for (int i=threadIdx.x; i < (NSFW*SFT)>>3; i += PRODUCER_THREADS) {
-                    int j = i/(SFT>>3);
-                    int o = (i-j*(SFT>>3))<<3;
-                    int64_t tile = (static_cast<int64_t>(expert_idx)*(K>>7) + bx_col*NSFW + j)*(H>>7) + stage;
-                    cp_async::cg64<8>(
-                        static_cast<uint32_t>(__cvta_generic_to_shared(smem.sfw+smem_stage*NSFW*SFT+j*SFT+o)),
-                        w2_scales + tile*SFT + o
-                    );
-                }
                 bar_copy[smem_stage].arrive_cp_async_mem();
-                if (!threadIdx.x) {
-                    bar_copy[smem_stage].expect_nb((WSD+XSD)*sizeof(__nv_fp8_e4m3));
-                    cp_async::load3d(smem.w+smem_stage*WSD, &map_w2, *bar_copy[smem_stage],
-                                     0, expert_idx*K+bx_col*TCN, (stage*CK)>>4);
-                    cp_async::load3d(smem.x+smem_stage*XSD, &map_act, *bar_copy[smem_stage],
-                                     0, by_row*BM, stage*(CK>>4));
-                }
+                if (!threadIdx.x)
+                    cp_async::load(smem.x+smem_stage*XSD, &map_act, *bar_copy[smem_stage],
+                                   stage*CK, by_row*BM);
                 ++smem_stage;
             }
             return;
@@ -522,8 +630,8 @@ namespace pi {
             for (int stage=0; stage < n_stages; ++stage) {
                 if (smem_stage == STAGES) { phase^=1; smem_stage = 0; }
                 bar_copy[smem_stage].await(phase);
-                uint32_t sfa = 256u + (stage&1)*16u;      // double-buffered scale columns:
-                uint32_t sfb = sfa + 4u;                  // the next stage never overwrites in-flight SFs
+                uint32_t sfa = 256u + (stage&3)*16u;      // rotating scale columns:
+                uint32_t sfb = sfa + 4u;                  // in-flight stages never overwrite each other's SFs
                 tcgen05::cp_sf_32x128b(tmem_acc+sfa, tcgen05::encode_sf_smem_desc(smem.sfx+smem_stage*SFT));
                 #pragma unroll
                 for (int j=0; j < NSFW; ++j)
@@ -531,19 +639,20 @@ namespace pi {
                         tcgen05::encode_sf_smem_desc(smem.sfw+smem_stage*NSFW*SFT+j*SFT));
                 #pragma unroll
                 for (int k32=0; k32 < KB; ++k32) {
-                    auto *__restrict__ a_ptr = smem.x+smem_stage*XSD+k32*BM*32;
-                    auto *__restrict__ b_ptr = smem.w+smem_stage*WSD+k32*TCN*32;
-                    uint64_t a_desc = tcgen05::encode_smem_desc(a_ptr, BM);
-                    uint64_t b_desc = tcgen05::encode_smem_desc(b_ptr, TCN);
+                    auto *__restrict__ a_ptr = smem.x+smem_stage*XSD+(k32<<5);
+                    auto *__restrict__ b_ptr = smem.w+smem_stage*WSD+(k32<<5);
+                    uint64_t a_desc = tcgen05::encode_smem_desc_swz<128>(a_ptr);
+                    uint64_t b_desc = tcgen05::encode_smem_desc_swz<128>(b_ptr);
                     tcgen05::mma_mxf8f6f4(tmem_acc, a_desc, b_desc,
                         tcgen05::idesc_with_sf_id(idesc, k32),
                         tmem_acc+sfa, tmem_acc+sfb, stage||k32);
                 }
-                tcgen05::commit_mbarrier(*bar_mma[smem_stage]);
-                bar_mma[smem_stage].await(phase);
-                bar_recycle[smem_stage].arrive();
+                // slot recycling is driven by the MMA unit directly
+                tcgen05::commit_mbarrier(*bar_recycle[smem_stage]);
                 ++smem_stage;
             }
+            tcgen05::commit_mbarrier(*bar_mma[0]);
+            bar_mma[0].await(0);
         }
         asm volatile ("bar.sync 1, 128;\n");
         tcgen05::after_thread_sync();
@@ -607,14 +716,16 @@ namespace pi {
         if (cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM) != cudaSuccess)
             throw std::runtime_error {"Failed to set max dynamic shared memory size for fused_moe_mxfp8_kernel: "+std::to_string(SMEM)+" bytes"};
 
-        CUtensorMap map_w = init_tmap_swiglu_kmajor_5d_fp8(
+        const uint64_t Hh = static_cast<uint64_t>(N) >> 1;
+        CUtensorMap map_w = init_tmap<4>(
             "w",
+            CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8,
             w,
-            static_cast<uint64_t>(num_experts),
-            static_cast<uint64_t>(N),
-            static_cast<uint64_t>(K),
-            BN*WN,
-            BK
+            {static_cast<uint64_t>(K), 128ull, static_cast<uint64_t>(num_experts)<<1, Hh>>7},
+            {static_cast<uint64_t>(K), Hh*K, 128ull*K},
+            {static_cast<uint32_t>(BK), 128u, 2u, 1u},
+            {1u, 1u, 1u, 1u},
+            CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B
         );
         CUtensorMap map_w2 = init_tmap_kmajor_3d_fp8(
             "w2",
@@ -628,14 +739,20 @@ namespace pi {
         const int n_blocks = sorted_num / BM;
         __nv_fp8_e4m3 *act_ws = nullptr;
         uint8_t *sf_ws = nullptr;
+        __nv_fp8_e4m3 *x_ws = nullptr;
+        uint8_t *xsf_ws = nullptr;
         static cudaStream_t zs = nullptr;
         static cudaEvent_t ze_head = nullptr, ze_zero = nullptr;
         if constexpr (SPLIT) {
             const size_t act_bytes = static_cast<size_t>(sorted_num)*HD;
             const size_t sf_bytes = static_cast<size_t>(n_blocks)*(HD>>7)*512;
-            if (cudaMallocAsync(&act_ws, act_bytes + sf_bytes, stream) != cudaSuccess)
+            const size_t x_bytes = static_cast<size_t>(sorted_num)*K;
+            const size_t xsf_bytes = static_cast<size_t>(n_blocks)*(K>>7)*512;
+            if (cudaMallocAsync(&act_ws, act_bytes + sf_bytes + x_bytes + xsf_bytes, stream) != cudaSuccess)
                 throw std::runtime_error {"failed to allocate the mxfp8 split act workspace"};
             sf_ws = reinterpret_cast<uint8_t *>(act_ws) + act_bytes;
+            x_ws = reinterpret_cast<__nv_fp8_e4m3 *>(sf_ws + sf_bytes);
+            xsf_ws = reinterpret_cast<uint8_t *>(x_ws) + x_bytes;
             if (!zs) {
                 cudaStreamCreateWithFlags(&zs, cudaStreamNonBlocking);
                 cudaEventCreateWithFlags(&ze_head, cudaEventDisableTiming);
@@ -656,9 +773,27 @@ namespace pi {
             {1u, 1u, 1u},
             CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE
         );
+        CUtensorMap map_x = init_tmap<2>(
+            "x_fp8",
+            CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8,
+            SPLIT ? reinterpret_cast<const uint8_t *>(x_ws) : reinterpret_cast<const uint8_t *>(x),
+            {static_cast<uint64_t>(K), SPLIT ? static_cast<uint64_t>(sorted_num) : static_cast<uint64_t>(M)},
+            {static_cast<uint64_t>(K)},
+            {static_cast<uint32_t>(BK), SPLIT ? 128u : 1u},
+            {1u, 1u},
+            CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B
+        );
+        if constexpr (SPLIT) {
+            gather_x_mxfp8_kernel<<<(sorted_num+7)/8, 256, 0, stream>>>(
+                x, x_scales, x_ws, xsf_ws, sorted_token_ids, num_tokens_post_padded,
+                static_cast<int32_t>(top_k), K
+            );
+        }
         kernel<<<grid, block, SMEM, stream>>>(
             x,
             x_scales,
+            map_x,
+            xsf_ws,
             map_w,
             w_scales,
             map_w2,
@@ -678,13 +813,33 @@ namespace pi {
         if constexpr (SPLIT) {
             static constexpr int TCN = 256;
             static constexpr int CK = 128;
-            static constexpr int DSTAGES = 2;
+            static constexpr int DSTAGES = 3;
             static constexpr int DPROD = 128;
             auto *dkernel = fused_moe_mxfp8_down_kernel<BM, CK, TCN, DSTAGES, DPROD>;
             static constexpr size_t DSMEM_SZ = sizeof(smem_down_split_pod_mxfp8<DSTAGES, CK, TCN, BM>);
             if (cudaFuncSetAttribute(dkernel, cudaFuncAttributeMaxDynamicSharedMemorySize, DSMEM_SZ) != cudaSuccess)
                 throw std::runtime_error {"failed to set smem for fused_moe_mxfp8_down_kernel"};
             cudaStreamWaitEvent(stream, ze_zero, 0);
+            CUtensorMap map_act_ld = init_tmap<2>(
+                "act_ld_fp8",
+                CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8,
+                reinterpret_cast<uint8_t *>(act_ws),
+                {HD, static_cast<uint64_t>(sorted_num)},
+                {HD},
+                {static_cast<uint32_t>(CK), static_cast<uint32_t>(BM)},
+                {1u, 1u},
+                CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B
+            );
+            CUtensorMap map_w2d = init_tmap<2>(
+                "w2d_fp8",
+                CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8,
+                w2,
+                {HD, static_cast<uint64_t>(K)*num_experts},
+                {HD},
+                {static_cast<uint32_t>(CK), static_cast<uint32_t>(TCN)},
+                {1u, 1u},
+                CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B
+            );
             dim3 dgrid = {static_cast<uint32_t>(K/TCN), static_cast<uint32_t>(sorted_num/BM), 1};
             dim3 dblock = {128+DPROD, 1, 1};
             cudaLaunchConfig_t dcfg = {};
@@ -699,7 +854,7 @@ namespace pi {
             dcfg.numAttrs = 1;
             cudaError_t derr = cudaLaunchKernelEx(
                 &dcfg, dkernel,
-                map_act, sf_ws, map_w2, w2_scales, out,
+                map_act_ld, sf_ws, map_w2d, w2_scales, out,
                 sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights,
                 static_cast<int32_t>(top_k), M, K, static_cast<int>(HD)
             );

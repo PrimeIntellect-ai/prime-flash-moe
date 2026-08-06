@@ -4,7 +4,7 @@ import sys
 import prime_moe
 import torch
 
-from prime_moe.mxfp8 import BLOCK, pack_scales_blocked
+from prime_moe import BLOCK, pack_scales_blocked
 
 # Accuracy gates. Both sides run on the same dequantized values, so the residual is
 # accumulation order plus the activation requantization before the down projection.
@@ -153,6 +153,7 @@ def test_cfg(num_tokens, K, E, N, top_k, block_m, bn, wn, stages):
         wn,
         stages,
         1,
+        1,
     )
     torch.cuda.synchronize()
 
@@ -214,7 +215,7 @@ def test_public_wrapper():
         x_q, x_sf, w1_q, pack_scales_blocked(w1_sf), w2_q, pack_scales_blocked(w2_sf),
         sorted_token_ids, expert_ids, num_tokens_post_padded, topk_weights,
     )
-    tail = (top_k, block_m, 32, 8, 1, 1)
+    tail = (top_k, block_m, 32, 8, 1, 1, 1)
 
     raw = torch.zeros((T, K), dtype=torch.bfloat16, device='cuda:0')
     torch.ops.prime_moe.fused_moe_mxfp8(*args, raw, *tail)
