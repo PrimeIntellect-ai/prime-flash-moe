@@ -532,7 +532,7 @@ namespace pi {
         if (cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM) != cudaSuccess)
             throw std::runtime_error {"Failed to set max dynamic shared memory size for fused_moe_kernel: "+std::to_string(SMEM)+" bytes"};
 
-        constexpr auto W_SWZ = BK == 64 ? CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128 : CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_64B;
+        constexpr auto W_SWZ = BK == 64 ? CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B : CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_64B;
         const uint64_t H = static_cast<uint64_t>(N) >> 1;
         CUtensorMap map_w = init_tmap<4>(
             "w",

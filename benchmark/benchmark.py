@@ -1,15 +1,20 @@
-"""Benchmark the fused MoE kernels against torch's grouped GEMM path.
+"""Benchmark the fused MoE kernels against torch's grouped GEMM path and a naive loop.
 
-The baseline is the realistic "no fused kernel" option: a single grouped GEMM call per
-projection (``torch.nn.functional.grouped_mm`` for bf16, ``scaled_grouped_mm`` for mxfp8),
-not a per-expert python loop. That is what you would actually reach for without a custom
-kernel, so it is the fair ruler for "is the fused kernel worth it":
+The primary baseline is the realistic "no fused kernel" option: a single grouped GEMM call
+per projection (``torch.nn.functional.grouped_mm`` for bf16, ``scaled_grouped_mm`` for
+mxfp8), not a per-expert python loop. That is what you would actually reach for without a
+custom kernel, so it is the fair ruler for "is the fused kernel worth it":
 
     gate_up = grouped_mm(x, w1, offs)         # one launch across every expert
     gate, up = gate_up.chunk(2, dim=-1)
     act = F.silu(gate) * up
     expert_out = grouped_mm(act, w2, offs)    # one launch across every expert
     out = routing_weight * expert_out
+
+A second, naive baseline is also timed: the textbook per-expert python loop, one plain
+GEMM pair per expert (``x[rows] @ w1[e].T`` → SwiGLU → ``act @ w2[e].T``; ``scaled_mm``
+per expert for mxfp8). It shows what the fused kernel buys over the simplest possible
+implementation, not just over torch's best grouped path.
 
 Routing, sorting, the gather and the final scatter all happen once during setup and sit
 outside the timed region for both sides, so neither implementation is charged for
@@ -73,14 +78,15 @@ E4M3_EMAX = 8  # 448 == 1.75 * 2**8
 MX = ScalingType.BlockWise1x32
 SWZ = SwizzleType.SWIZZLE_32_4_4
 
-# validated categorical slots 1/2/3 (see the dataviz palette), light surface
+# validated categorical slots 1/2/3 (see the dataviz palette), light surface; the
+# speedup bars reuse the comparator's slot so color follows the entity across panels
 SURFACE = '#fcfcfb'
 INK = '#0b0b0b'
 INK_SOFT = '#52514e'
 GRID = '#e4e3de'
 C_TORCH = '#2a78d6'
 C_FUSED = '#eb6834'
-C_SPEEDUP = '#1baf7a'
+C_NAIVE = '#1baf7a'
 
 
 # ---------------------------------------------------------------- mxfp8 helpers
@@ -214,10 +220,58 @@ def build_grouped_mxfp8_inputs(x: torch.Tensor, topk_weights: torch.Tensor, rout
         'offs': offs,
         'tok': tok,
         'valid': valid,
+        'padded_counts': padded_counts,
     }
 
 
-# ---------------------------------------------------------------- the two implementations
+def expert_bounds(counts: list[int]) -> list[tuple[int, int]]:
+    """Host-side (start, end) row ranges per expert, so the naive loop slices with python ints."""
+    bounds, ptr = [], 0
+    for c in counts:
+        bounds.append((ptr, ptr + c))
+        ptr += c
+    return bounds
+
+
+# ---------------------------------------------------------------- the three implementations
+
+
+def torch_naive_bf16(xg: torch.Tensor, w1: torch.Tensor, w2: torch.Tensor, bounds: list[tuple[int, int]], wg: torch.Tensor) -> torch.Tensor:
+    out = torch.empty((xg.shape[0], w2.shape[1]), dtype=torch.bfloat16, device=xg.device)
+    for e, (s, t) in enumerate(bounds):
+        if s == t:
+            continue
+        gate_up = xg[s:t] @ w1[e].T
+        gate, up = gate_up.chunk(2, dim=-1)
+        act = F.silu(gate) * up
+        out[s:t] = wg[s:t].unsqueeze(1) * (act @ w2[e].T)
+    return out
+
+
+def torch_naive_mxfp8(
+    xq: torch.Tensor,
+    xsf: torch.Tensor,
+    w1q: torch.Tensor,
+    w1sf: torch.Tensor,
+    w2q: torch.Tensor,
+    w2sf: torch.Tensor,
+    bounds: list[tuple[int, int]],
+    wg: torch.Tensor,
+) -> torch.Tensor:
+    # the mxfp8 groups are padded to 128 rows, so every slice starts on a scale swizzle
+    # tile boundary and the packed per-row scales can be sliced right along with the data
+    out = torch.empty((xq.shape[0], w2q.shape[1]), dtype=torch.bfloat16, device=xq.device)
+    for e, (s, t) in enumerate(bounds):
+        if s == t:
+            continue
+        gate_up = scaled_mm(xq[s:t], w1q[e].t(), xsf[s:t], MX, w1sf[e], MX, swizzle_a=SWZ, swizzle_b=SWZ, output_dtype=torch.bfloat16)
+        gate, up = gate_up.chunk(2, dim=-1)
+        act = F.silu(gate) * up
+        act_q, act_sf = quantize_mx(act)
+        act_sf_packed = pack_scales_blocked(act_sf).view(act.shape[0], -1)
+        expert_out = scaled_mm(act_q, w2q[e].t(), act_sf_packed, MX, w2sf[e], MX, swizzle_a=SWZ, swizzle_b=SWZ, output_dtype=torch.bfloat16)
+        out[s:t] = wg[s:t].unsqueeze(1) * expert_out
+    return out
 
 
 def torch_grouped_bf16(xg: torch.Tensor, w1t: torch.Tensor, w2t: torch.Tensor, offs: torch.Tensor, wg: torch.Tensor) -> torch.Tensor:
@@ -383,7 +437,9 @@ def run_one(dtype: str, num_tokens: int, args: argparse.Namespace) -> dict:
         state |= {'x': x, 'w1': w1, 'w2': w2}
         g = build_grouped_bf16_inputs(x, topk_weights, routing, top_k)
         w1t, w2t = w1.transpose(1, 2), w2.transpose(1, 2)
+        bounds = expert_bounds(routing['counts'])
         baseline_fn = lambda: torch_grouped_bf16(g['xg'], w1t, w2t, g['offs'], g['wg'])
+        naive_fn = lambda: torch_naive_bf16(g['xg'], w1, w2, bounds, g['wg'])
         fused_fn = lambda: fused_bf16(state)
         scatter_tok, scatter_mask = g['tok'], None
     else:
@@ -400,31 +456,46 @@ def run_one(dtype: str, num_tokens: int, args: argparse.Namespace) -> dict:
         w1_sf_flat = w1_sf_e.reshape(E, -1)
         w2_sf_flat = w2_sf_e.reshape(E, -1)
         w1_qt, w2_qt = w1_q.transpose(1, 2), w2_q.transpose(1, 2)
+        bounds = expert_bounds(g['padded_counts'])
         baseline_fn = lambda: torch_grouped_mxfp8(gxq, gxsf_packed, w1_qt, w1_sf_flat, w2_qt, w2_sf_flat, g['offs'], g['wg'])
+        naive_fn = lambda: torch_naive_mxfp8(gxq, gxsf_packed, w1_q, w1_sf_flat, w2_q, w2_sf_flat, bounds, g['wg'])
         fused_fn = lambda: fused_mxfp8(state)
         scatter_tok, scatter_mask = g['tok'], g['valid']
 
-    max_abs = rel = float('nan')
-    if args.check and not args.skip_fused:
+    max_abs = rel = naive_max_abs = float('nan')
+    if args.check:
         base_out = baseline_fn()
-        ref = torch.zeros_like(x)
-        if scatter_mask is None:
-            ref.index_add_(0, scatter_tok, base_out.to(x.dtype))
-        else:
-            ref.index_add_(0, scatter_tok[scatter_mask], base_out[scatter_mask].to(x.dtype))
-        got = fused_fn().clone()
-        torch.cuda.synchronize()
-        diff = (ref.float() - got.float()).abs()
-        max_abs = diff.max().item()
-        rel = (diff / ref.float().abs().clamp_min(1.0)).max().item()
+        if not args.skip_naive:
+            # naive and grouped share the same row layout, so they compare directly
+            naive_out = naive_fn()
+            ndiff = (base_out.float() - naive_out.float()).abs()
+            naive_max_abs = (ndiff[scatter_mask] if scatter_mask is not None else ndiff).max().item()
+            del naive_out
+        if not args.skip_fused:
+            ref = torch.zeros_like(x)
+            if scatter_mask is None:
+                ref.index_add_(0, scatter_tok, base_out.to(x.dtype))
+            else:
+                ref.index_add_(0, scatter_tok[scatter_mask], base_out[scatter_mask].to(x.dtype))
+            got = fused_fn().clone()
+            torch.cuda.synchronize()
+            diff = (ref.float() - got.float()).abs()
+            max_abs = diff.max().item()
+            rel = (diff / ref.float().abs().clamp_min(1.0)).max().item()
 
     baseline_run = baseline_fn
+    naive_run = naive_fn
     fused_run = fused_fn
     if args.cuda_graphs:
         g_ = graphed(baseline_fn)
         baseline_run = g_ or baseline_fn
         if g_ is None:
             print('  note: CUDA graph capture failed for the torch baseline, timing it eagerly')
+        if not args.skip_naive:
+            g_ = graphed(naive_fn)
+            naive_run = g_ or naive_fn
+            if g_ is None:
+                print('  note: CUDA graph capture failed for the naive loop, timing it eagerly')
         if not args.skip_fused:
             g_ = graphed(fused_fn)
             fused_run = g_ or fused_fn
@@ -432,6 +503,7 @@ def run_one(dtype: str, num_tokens: int, args: argparse.Namespace) -> dict:
                 print('  note: CUDA graph capture failed for the fused kernel, timing it eagerly')
 
     baseline_ms = bench_cuda(baseline_run, args.warmup, args.iters)
+    naive_ms = float('nan') if args.skip_naive else bench_cuda(naive_run, args.warmup, args.iters)
     fused_ms = float('nan') if args.skip_fused else bench_cuda(fused_run, args.warmup, args.iters)
 
     flops = approx_flops(num_tokens, top_k, K, N)
@@ -442,15 +514,19 @@ def run_one(dtype: str, num_tokens: int, args: argparse.Namespace) -> dict:
         'K': K,
         'N': N,
         'top_k': top_k,
+        'naive_ms': naive_ms,
         'baseline_ms': baseline_ms,
         'fused_ms': fused_ms,
         'speedup': baseline_ms / fused_ms,
+        'speedup_naive': naive_ms / fused_ms,
+        'naive_tflops': flops / (naive_ms * 1e-3) / 1e12,
         'baseline_tflops': flops / (baseline_ms * 1e-3) / 1e12,
         'fused_tflops': flops / (fused_ms * 1e-3) / 1e12,
         'max_abs': max_abs,
         'rel': rel,
+        'naive_max_abs': naive_max_abs,
     }
-    del state, baseline_run, fused_run, baseline_fn, fused_fn
+    del state, baseline_run, naive_run, fused_run, baseline_fn, naive_fn, fused_fn
     torch.cuda.synchronize()
     torch.cuda.empty_cache()
     return row
@@ -464,17 +540,32 @@ def fmt_tokens(t: int) -> str:
 
 
 BASELINE_LABEL = {'bf16': 'torch grouped_mm (bf16)', 'mxfp8': 'torch scaled_grouped_mm (mxfp8)'}
+NAIVE_LABEL = {'bf16': 'naive expert loop (bf16)', 'mxfp8': 'naive expert loop (mxfp8)'}
 FUSED_LABEL = {'bf16': 'fused MoE (bf16)', 'mxfp8': 'fused MoE (mxfp8)'}
 
 
+def _fmt_ms(v: float) -> str:
+    return 'n/a' if v != v else f'{v:.3f} ms'
+
+
+def _fmt_x(v: float) -> str:
+    return 'n/a' if v != v else f'{v:.2f}x'
+
+
 def print_table(dtype: str, rows: list[dict]) -> None:
-    base, fused = BASELINE_LABEL[dtype], FUSED_LABEL[dtype]
-    head = ('tokens', base, fused, 'speedup')
+    head = ('tokens', NAIVE_LABEL[dtype], BASELINE_LABEL[dtype], FUSED_LABEL[dtype], 'vs grouped', 'vs naive')
     body = [
-        (fmt_tokens(r['tokens']), f'{r["baseline_ms"]:.3f} ms', f'{r["fused_ms"]:.3f} ms', f'{r["speedup"]:.2f}x')
+        (
+            fmt_tokens(r['tokens']),
+            _fmt_ms(r['naive_ms']),
+            _fmt_ms(r['baseline_ms']),
+            _fmt_ms(r['fused_ms']),
+            _fmt_x(r['speedup']),
+            _fmt_x(r['speedup_naive']),
+        )
         for r in rows
     ]
-    widths = [max(len(head[i]), max((len(b[i]) for b in body), default=0)) for i in range(4)]
+    widths = [max(len(head[i]), max((len(b[i]) for b in body), default=0)) for i in range(len(head))]
     print(f'\n{dtype}')
     print('  '.join(h.ljust(w) for h, w in zip(head, widths)).rstrip())
     for b in body:
@@ -489,12 +580,15 @@ def print_table(dtype: str, rows: list[dict]) -> None:
 def plot_dtype(dtype: str, rows: list[dict], path: str, subtitle: str) -> None:
     labels = [fmt_tokens(r['tokens']) for r in rows]
     xs = list(range(len(rows)))
+    naive = [r['naive_ms'] for r in rows]
     base = [r['baseline_ms'] for r in rows]
     fused = [r['fused_ms'] for r in rows]
     speedup = [r['speedup'] for r in rows]
+    speedup_naive = [r['speedup_naive'] for r in rows]
+    have_naive = all(v == v for v in naive)
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12.5, 5.0), facecolor=SURFACE)
-    fig.suptitle(f'Fused MoE vs torch grouped GEMM — {dtype}', x=0.012, y=0.965, ha='left', fontsize=15, color=INK, weight='bold')
+    fig.suptitle(f'Fused MoE vs torch baselines — {dtype}', x=0.012, y=0.965, ha='left', fontsize=15, color=INK, weight='bold')
     fig.text(0.012, 0.912, subtitle, ha='left', fontsize=9.5, color=INK_SOFT)
 
     for ax in (ax1, ax2):
@@ -508,6 +602,8 @@ def plot_dtype(dtype: str, rows: list[dict], path: str, subtitle: str) -> None:
         ax.set_xticks(xs, labels)
         ax.set_xlabel('tokens', fontsize=9.5, color=INK_SOFT)
 
+    if have_naive:
+        ax1.plot(xs, naive, color=C_NAIVE, linewidth=2, marker='o', markersize=6, label=NAIVE_LABEL[dtype], zorder=3)
     ax1.plot(xs, base, color=C_TORCH, linewidth=2, marker='o', markersize=6, label=BASELINE_LABEL[dtype], zorder=3)
     ax1.plot(xs, fused, color=C_FUSED, linewidth=2, marker='o', markersize=6, label=FUSED_LABEL[dtype], zorder=3)
     ax1.set_yscale('log')
@@ -516,6 +612,11 @@ def plot_dtype(dtype: str, rows: list[dict], path: str, subtitle: str) -> None:
     ax1.set_xlim(-0.35, len(xs) - 1 + 0.75)
     ax1.set_title('median latency (ms, log scale)', fontsize=10.5, color=INK, loc='left', pad=10)
     # selective direct labels: the value at the last point, identity comes from the legend
+    if have_naive:
+        ax1.annotate(
+            f'{naive[-1]:.2f} ms', (xs[-1], naive[-1]), textcoords='offset points', xytext=(7, 3),
+            ha='left', fontsize=9, color=INK,
+        )
     ax1.annotate(
         f'{base[-1]:.2f} ms', (xs[-1], base[-1]), textcoords='offset points', xytext=(7, 3),
         ha='left', fontsize=9, color=INK,
@@ -527,12 +628,25 @@ def plot_dtype(dtype: str, rows: list[dict], path: str, subtitle: str) -> None:
     leg = ax1.legend(frameon=False, fontsize=9, labelcolor=INK_SOFT, loc='upper left')
     leg.set_zorder(4)
 
+    # speedup bars are colored by the comparator so they match its latency line
     ax2.axhline(1.0, color=INK_SOFT, linewidth=1, linestyle=(0, (4, 4)), zorder=2)
-    ax2.bar(xs, speedup, width=0.62, color=C_SPEEDUP, zorder=3)
-    ax2.set_ylim(0, max(speedup) * 1.22)
-    ax2.set_title('speedup over the torch baseline', fontsize=10.5, color=INK, loc='left', pad=10)
-    for xi, s in zip(xs, speedup):
-        ax2.annotate(f'{s:.2f}x', (xi, s), textcoords='offset points', xytext=(0, 6), ha='center', fontsize=9, color=INK)
+    if have_naive:
+        ax2.bar([x - 0.19 for x in xs], speedup, width=0.36, color=C_TORCH, label='vs grouped GEMM', zorder=3)
+        ax2.bar([x + 0.19 for x in xs], speedup_naive, width=0.36, color=C_NAIVE, label='vs naive loop', zorder=3)
+        tops = speedup + speedup_naive
+        for xi, s in zip(xs, speedup):
+            ax2.annotate(f'{s:.2f}x', (xi - 0.19, s), textcoords='offset points', xytext=(0, 6), ha='center', fontsize=8, color=INK)
+        for xi, s in zip(xs, speedup_naive):
+            ax2.annotate(f'{s:.2f}x', (xi + 0.19, s), textcoords='offset points', xytext=(0, 6), ha='center', fontsize=8, color=INK)
+        leg2 = ax2.legend(frameon=False, fontsize=9, labelcolor=INK_SOFT, loc='upper left')
+        leg2.set_zorder(4)
+    else:
+        ax2.bar(xs, speedup, width=0.62, color=C_TORCH, zorder=3)
+        tops = speedup
+        for xi, s in zip(xs, speedup):
+            ax2.annotate(f'{s:.2f}x', (xi, s), textcoords='offset points', xytext=(0, 6), ha='center', fontsize=9, color=INK)
+    ax2.set_ylim(0, max(tops) * 1.22)
+    ax2.set_title('fused speedup over each baseline', fontsize=10.5, color=INK, loc='left', pad=10)
 
     fig.tight_layout(rect=(0, 0, 1, 0.9))
     fig.savefig(path, dpi=170, facecolor=SURFACE)
@@ -572,7 +686,8 @@ def main() -> None:
     p.add_argument('--seed', type=int, default=0)
     p.add_argument('--check', action='store_true', help='compare the fused output against the torch baseline')
     p.add_argument('--cuda-graphs', action=argparse.BooleanOptionalAction, default=True)
-    p.add_argument('--skip-fused', action='store_true', help='time the torch baseline only')
+    p.add_argument('--skip-fused', action='store_true', help='time the torch baselines only')
+    p.add_argument('--skip-naive', action='store_true', help='skip the naive per-expert loop baseline')
     p.add_argument('--outdir', type=str, default='.')
     args = p.parse_args()
 
@@ -588,7 +703,7 @@ def main() -> None:
         f'median of {args.iters} runs, {"CUDA graph replay" if args.cuda_graphs else "eager"}'
     )
     print(subtitle)
-    print('baseline timing covers the grouped GEMMs, SwiGLU and the routing scale only; gather/scatter are excluded')
+    print('baseline timing (grouped and naive) covers the GEMMs, SwiGLU and the routing scale only; gather/scatter are excluded')
 
     all_rows = []
     for dtype in args.dtypes:
@@ -605,9 +720,12 @@ def main() -> None:
                 torch.cuda.empty_cache()
                 continue
             rows.append(row)
-            msg = f'  baseline={row["baseline_ms"]:.3f} ms  fused={row["fused_ms"]:.3f} ms  speedup={row["speedup"]:.2f}x'
+            msg = (
+                f'  naive={row["naive_ms"]:.3f} ms  grouped={row["baseline_ms"]:.3f} ms  fused={row["fused_ms"]:.3f} ms'
+                f'  vs_grouped={row["speedup"]:.2f}x  vs_naive={row["speedup_naive"]:.2f}x'
+            )
             if args.check:
-                msg += f'  max_abs={row["max_abs"]:.4g}  rel={row["rel"]:.4g}'
+                msg += f'  max_abs={row["max_abs"]:.4g}  rel={row["rel"]:.4g}  naive_vs_grouped={row["naive_max_abs"]:.4g}'
             print(msg)
         if not rows:
             continue
