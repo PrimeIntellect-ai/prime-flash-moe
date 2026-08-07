@@ -12,12 +12,6 @@
 Prime Flash MoE: Fused MoE Kernels for Blackwell
 </h3>
 
-<p align="center">
-  <a href="https://github.com/PrimeIntellect-ai/verifiers">Verifiers</a> &bull;
-  <a href="https://github.com/PrimeIntellect-ai/prime-rl">PRIME-RL</a> &bull;
-  <a href="https://github.com/PrimeIntellect-ai/prime-agent">Prime Agent</a>
-</p>
-
 ---
 
 Fused Mixture-of-Experts forward kernels for NVIDIA Blackwell, written against `tcgen05`.
