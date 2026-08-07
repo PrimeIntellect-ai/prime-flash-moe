@@ -24,7 +24,12 @@ replays by default so the numbers are GPU time, not python dispatch time.
 Two dtypes are reported. bf16 compares against ``torch.nn.functional.grouped_mm``; mxfp8
 compares against ``torch.nn.functional.scaled_grouped_mm`` with OCP MX (1x32 e8m0) block
 scales on both operands, and the baseline requantizes the intermediate activation exactly
-like the kernel does. mxfp8 groups must start on a 128 row boundary (the MX swizzle tile),
+like the kernel does. mxfp8 additionally emits a third, "no requant" comparison where the
+torch baseline's intermediate requantize/pack is moved out of the timed region (the second
+GEMM reads a pre-quantized activation) while the fused kernel still requantizes on chip —
+deliberately unfair, but it isolates the raw GEMM-side speedup from the fusion win of not
+round-tripping the requant through global memory. mxfp8 groups must start on a 128 row
+boundary (the MX swizzle tile),
 so each expert's slice of the grouped call is padded up to a multiple of 128 rows; bf16
 has no such constraint and runs on the raw, unpadded per-expert counts.
 
@@ -271,6 +276,32 @@ def torch_grouped_mxfp8(
     return wg.unsqueeze(1) * expert_out
 
 
+def torch_grouped_mxfp8_noreq(
+    xq: torch.Tensor,
+    xsf: torch.Tensor,
+    w1qt: torch.Tensor,
+    w1sf: torch.Tensor,
+    act_q: torch.Tensor,
+    act_sf: torch.Tensor,
+    w2qt: torch.Tensor,
+    w2sf: torch.Tensor,
+    offs: torch.Tensor,
+    wg: torch.Tensor,
+) -> torch.Tensor:
+    """The grouped mxfp8 baseline with the intermediate requant taken out of the timed path.
+
+    The second GEMM reads a pre-quantized activation prepared during setup, so the timed
+    region covers the two grouped GEMMs and the SwiGLU but not ``quantize_mx``/``pack``.
+    The fused kernel still requantizes on chip, so this comparison is deliberately unfair
+    to it — it isolates the raw GEMM-side speedup.
+    """
+    gate_up = F.scaled_grouped_mm(xq, w1qt, xsf, MX, w1sf, MX, swizzle_a=SWZ, swizzle_b=SWZ, offs=offs, output_dtype=torch.bfloat16)
+    gate, up = gate_up.chunk(2, dim=-1)
+    F.silu(gate) * up  # noqa: B018 — the activation math stays in the timing, only its requant is skipped
+    expert_out = F.scaled_grouped_mm(act_q, w2qt, act_sf, MX, w2sf, MX, swizzle_a=SWZ, swizzle_b=SWZ, offs=offs, output_dtype=torch.bfloat16)
+    return wg.unsqueeze(1) * expert_out
+
+
 def fused_bf16(state: dict) -> torch.Tensor:
     if not state['split']:
         state['out'].zero_()
@@ -402,6 +433,7 @@ def run_one(dtype: str, num_tokens: int, args: argparse.Namespace) -> dict:
         baseline_fn = lambda: torch_grouped_bf16(g['xg'], w1t, w2t, g['offs'], g['wg'])
         naive_fn = lambda: torch_naive_bf16(g['xg'], w1, w2, bounds, g['wg'])
         fused_fn = lambda: fused_bf16(state)
+        noreq_fn = None  # bf16 has no intermediate quantization to strip
         scatter_tok, scatter_mask = g['tok'], None
     else:
         x_q, x_sf = quantize_mx(x)
@@ -421,6 +453,19 @@ def run_one(dtype: str, num_tokens: int, args: argparse.Namespace) -> dict:
         baseline_fn = lambda: torch_grouped_mxfp8(gxq, gxsf_packed, w1_qt, w1_sf_flat, w2_qt, w2_sf_flat, g['offs'], g['wg'])
         naive_fn = lambda: torch_naive_mxfp8(gxq, gxsf_packed, w1_q, w1_sf_flat, w2_q, w2_sf_flat, bounds, g['wg'])
         fused_fn = lambda: fused_mxfp8(state)
+        # prepare a quantized activation once so the no-requant baseline can skip the
+        # quantize_mx/pack step inside the timed loop (values are static, timing-only)
+        gate_up = F.scaled_grouped_mm(
+            gxq, w1_qt, gxsf_packed, MX, w1_sf_flat, MX, swizzle_a=SWZ, swizzle_b=SWZ, offs=g['offs'], output_dtype=torch.bfloat16
+        )
+        gate, up = gate_up.chunk(2, dim=-1)
+        act = F.silu(gate) * up
+        act_q_pre, act_sf_pre = quantize_mx(act)
+        act_sf_pre_packed = pack_scales_blocked(act_sf_pre).view(act.shape[0], -1)
+        del gate_up, gate, up, act, act_sf_pre
+        noreq_fn = lambda: torch_grouped_mxfp8_noreq(
+            gxq, gxsf_packed, w1_qt, w1_sf_flat, act_q_pre, act_sf_pre_packed, w2_qt, w2_sf_flat, g['offs'], g['wg']
+        )
         scatter_tok, scatter_mask = g['tok'], g['valid']
 
     max_abs = rel = naive_max_abs = float('nan')
@@ -447,11 +492,17 @@ def run_one(dtype: str, num_tokens: int, args: argparse.Namespace) -> dict:
     baseline_run = baseline_fn
     naive_run = naive_fn
     fused_run = fused_fn
+    noreq_run = noreq_fn
     if args.cuda_graphs:
         g_ = graphed(baseline_fn)
         baseline_run = g_ or baseline_fn
         if g_ is None:
             print('  note: CUDA graph capture failed for the torch baseline, timing it eagerly')
+        if noreq_fn is not None:
+            g_ = graphed(noreq_fn)
+            noreq_run = g_ or noreq_fn
+            if g_ is None:
+                print('  note: CUDA graph capture failed for the no-requant baseline, timing it eagerly')
         if not args.skip_naive:
             g_ = graphed(naive_fn)
             naive_run = g_ or naive_fn
@@ -464,6 +515,7 @@ def run_one(dtype: str, num_tokens: int, args: argparse.Namespace) -> dict:
                 print('  note: CUDA graph capture failed for the fused kernel, timing it eagerly')
 
     baseline_ms = bench_cuda(baseline_run, args.warmup, args.iters)
+    noreq_ms = float('nan') if noreq_run is None else bench_cuda(noreq_run, args.warmup, args.iters)
     naive_ms = float('nan') if args.skip_naive else bench_cuda(naive_run, args.warmup, args.iters)
     fused_ms = float('nan') if args.skip_fused else bench_cuda(fused_run, args.warmup, args.iters)
 
@@ -477,8 +529,10 @@ def run_one(dtype: str, num_tokens: int, args: argparse.Namespace) -> dict:
         'top_k': top_k,
         'naive_ms': naive_ms,
         'baseline_ms': baseline_ms,
+        'noreq_ms': noreq_ms,
         'fused_ms': fused_ms,
         'speedup': baseline_ms / fused_ms,
+        'speedup_noreq': noreq_ms / fused_ms,
         'speedup_naive': naive_ms / fused_ms,
         'naive_tflops': flops / (naive_ms * 1e-3) / 1e12,
         'baseline_tflops': flops / (baseline_ms * 1e-3) / 1e12,
@@ -487,7 +541,7 @@ def run_one(dtype: str, num_tokens: int, args: argparse.Namespace) -> dict:
         'rel': rel,
         'naive_max_abs': naive_max_abs,
     }
-    del state, baseline_run, naive_run, fused_run, baseline_fn, naive_fn, fused_fn
+    del state, baseline_run, naive_run, fused_run, noreq_run, baseline_fn, naive_fn, fused_fn, noreq_fn
     torch.cuda.synchronize()
     torch.cuda.empty_cache()
     return row
@@ -497,9 +551,17 @@ def fmt_tokens(t: int) -> str:
     return f'{t // 1024}k' if t >= 1024 and t % 1024 == 0 else str(t)
 
 
-BASELINE_LABEL = {'bf16': 'torch grouped_mm (bf16)', 'mxfp8': 'torch scaled_grouped_mm (mxfp8)'}
-NAIVE_LABEL = {'bf16': 'torch naive expert loop (bf16)', 'mxfp8': 'naive expert loop (mxfp8)'}
-FUSED_LABEL = {'bf16': 'fused MoE (bf16)', 'mxfp8': 'fused MoE (mxfp8)'}
+BASELINE_LABEL = {
+    'bf16': 'torch grouped_mm (bf16)',
+    'mxfp8': 'torch scaled_grouped_mm (mxfp8)',
+    'mxfp8_noreq': 'torch scaled_grouped_mm (mxfp8, requant untimed)',
+}
+NAIVE_LABEL = {'bf16': 'torch naive expert loop (bf16)', 'mxfp8': 'naive expert loop (mxfp8)', 'mxfp8_noreq': ''}
+FUSED_LABEL = {
+    'bf16': 'fused MoE (bf16)',
+    'mxfp8': 'fused MoE (mxfp8)',
+    'mxfp8_noreq': 'fused MoE (mxfp8, requant on-chip)',
+}
 
 
 def _fmt_ms(v: float) -> str:
@@ -511,9 +573,13 @@ def _fmt_x(v: float) -> str:
 
 
 def print_table(dtype: str, rows: list[dict]) -> None:
+    has_noreq = any(r['noreq_ms'] == r['noreq_ms'] for r in rows)
     head = ('tokens', NAIVE_LABEL[dtype], BASELINE_LABEL[dtype], FUSED_LABEL[dtype], 'vs grouped', 'vs naive')
-    body = [
-        (
+    if has_noreq:
+        head += ('grouped w/o requant', 'vs grouped w/o requant')
+    body = []
+    for r in rows:
+        b = (
             fmt_tokens(r['tokens']),
             _fmt_ms(r['naive_ms']),
             _fmt_ms(r['baseline_ms']),
@@ -521,8 +587,9 @@ def print_table(dtype: str, rows: list[dict]) -> None:
             _fmt_x(r['speedup']),
             _fmt_x(r['speedup_naive']),
         )
-        for r in rows
-    ]
+        if has_noreq:
+            b += (_fmt_ms(r['noreq_ms']), _fmt_x(r['speedup_noreq']))
+        body.append(b)
     widths = [max(len(head[i]), max((len(b[i]) for b in body), default=0)) for i in range(len(head))]
     print(f'\n{dtype}')
     print('  '.join(h.ljust(w) for h, w in zip(head, widths)).rstrip())
@@ -535,7 +602,7 @@ def print_table(dtype: str, rows: list[dict]) -> None:
         print('| ' + ' | '.join(b) + ' |')
 
 
-def plot_dtype(dtype: str, rows: list[dict], path: str) -> None:
+def plot_dtype(dtype: str, rows: list[dict], path: str, title: str | None = None) -> None:
     labels = [fmt_tokens(r['tokens']) for r in rows]
     xs = list(range(len(rows)))
     naive = [r['naive_ms'] for r in rows]
@@ -546,7 +613,7 @@ def plot_dtype(dtype: str, rows: list[dict], path: str) -> None:
     have_naive = all(v == v for v in naive)
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12.5, 5.0), facecolor=SURFACE)
-    fig.suptitle(f'Fused MoE vs torch baselines — {dtype}', x=0.012, y=0.97, ha='left', fontsize=15, color=INK, weight='bold')
+    fig.suptitle(title or f'Fused MoE vs torch baselines — {dtype}', x=0.012, y=0.97, ha='left', fontsize=15, color=INK, weight='bold')
 
     for ax in (ax1, ax2):
         ax.set_facecolor(SURFACE)
@@ -687,6 +754,8 @@ def main() -> None:
                 f'  naive={row["naive_ms"]:.3f} ms  grouped={row["baseline_ms"]:.3f} ms  fused={row["fused_ms"]:.3f} ms'
                 f'  vs_grouped={row["speedup"]:.2f}x  vs_naive={row["speedup_naive"]:.2f}x'
             )
+            if row['noreq_ms'] == row['noreq_ms']:
+                msg += f'  grouped_noreq={row["noreq_ms"]:.3f} ms  vs_grouped_noreq={row["speedup_noreq"]:.2f}x'
             if args.check:
                 msg += f'  max_abs={row["max_abs"]:.4g}  rel={row["rel"]:.4g}  naive_vs_grouped={row["naive_max_abs"]:.4g}'
             print(msg)
@@ -698,6 +767,17 @@ def main() -> None:
             png = f'{args.outdir.rstrip("/")}/moe_bench_{dtype}.png'
             plot_dtype(dtype, rows, png)
             print(f'wrote {png}')
+            if any(r['noreq_ms'] == r['noreq_ms'] for r in rows):
+                # third plot: same fused numbers against the baseline with the intermediate
+                # requant untimed — unfair to the kernel (it still requantizes on chip), but
+                # shows the raw GEMM-side speedup
+                noreq_rows = [
+                    {**r, 'baseline_ms': r['noreq_ms'], 'speedup': r['speedup_noreq'], 'naive_ms': float('nan')}
+                    for r in rows
+                ]
+                png = f'{args.outdir.rstrip("/")}/moe_bench_{dtype}_noreq.png'
+                plot_dtype(f'{dtype}_noreq', noreq_rows, png, title=f'Fused MoE vs torch baseline — {dtype}, requant untimed for torch')
+                print(f'wrote {png}')
 
     if all_rows:
         csv = f'{args.outdir.rstrip("/")}/moe_bench.csv'
