@@ -1,11 +1,22 @@
 # prime-flash-moe
 
 Fused Mixture-of-Experts forward kernels for NVIDIA Blackwell, written against `tcgen05`.
-A single kernel launch does the gate/up projection, the SwiGLU activation, the down
-projection, and the top-k weighted reduction, so the intermediate activations never leave
-the chip.
+The gate/up projection, the SwiGLU activation, the down projection and the top-k weighted
+reduction are fused, so the `2H`-wide gate/up tensor is never materialized at all — it is
+consumed straight out of the accumulator.
 
-Two paths are provided:
+There are two pipelines, chosen with `split`:
+
+- `split=False` — one kernel launch does the whole FFN and the intermediate activation
+  never leaves the SM. The down projection is a split-K GEMM, so `out` is a global
+  accumulator and **the caller must zero it first**.
+- `split=True` (default) — the up projection and SwiGLU run as before, then the activation
+  is written to a workspace once and a second kernel does the down projection with no
+  split-K at all, chained by programmatic dependent launch. Trades one HBM round trip of
+  the `H`-wide activation for a reduction cost that otherwise grows with token count.
+  Zeroes `out` itself, on a side stream.
+
+Two data types are provided:
 
 | Path | Op | Weights | Activations | Accumulate |
 | --- | --- | --- | --- | --- |
@@ -38,11 +49,13 @@ Python wrappers in `prime_moe/__init__.py` return `out` for convenience.
 
 ```python
 prime_moe.fused_moe_bf16(x, w1, w2, sorted_token_ids, expert_ids, num_tokens_post_padded,
-                         topk_weights, out, top_k, block_m, block_n, warp_n, stages, bpc=1)
+                         topk_weights, out, top_k, block_m, block_n, warp_n, stages,
+                         bpc=1, cpc=1, split=True)
 
 prime_moe.fused_moe_mxfp8(x, x_scales, w1, w1_scales, w2, w2_scales,
                           sorted_token_ids, expert_ids, num_tokens_post_padded,
-                          topk_weights, out, top_k, block_m, block_n, warp_n, stages, bpc=1)
+                          topk_weights, out, top_k, block_m, block_n, warp_n, stages,
+                          bpc=1, split=True)
 
 sorted_token_ids, expert_ids, num_tokens_post_padded = torch.ops.prime_moe.moe_align(
     topk_ids, num_experts, block_m, bpc)

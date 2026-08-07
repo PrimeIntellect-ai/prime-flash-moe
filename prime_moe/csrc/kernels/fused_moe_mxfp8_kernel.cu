@@ -886,11 +886,11 @@ namespace pi {
         int num_experts,
         int sorted_num,
         int block_m,
-        int cluster,
+        bool split,
         cudaStream_t stream
     ) {
         #define launch_mxfp8(s) \
-            do { if (cluster == 8) launch_fused_moe_mxfp8_kernel<BM, BN, WN, s, true>(x, x_scales, w, w_scales, w2, w2_scales, out, sorted_token_ids, expert_idxs, \
+            do { if (split) launch_fused_moe_mxfp8_kernel<BM, BN, WN, s, true>(x, x_scales, w, w_scales, w2, w2_scales, out, sorted_token_ids, expert_idxs, \
             num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream); \
             else launch_fused_moe_mxfp8_kernel<BM, BN, WN, s>(x, x_scales, w, w_scales, w2, w2_scales, out, sorted_token_ids, expert_idxs, \
             num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream); } while (0)
@@ -927,15 +927,15 @@ namespace pi {
         int num_experts,
         int sorted_num,
         int block_m,
-        int cluster,
+        bool split,
         cudaStream_t stream
     ) {
         switch (((bn&0xff)<<8)+(wn&0xff)) {
             case (32<<8)+8:
-                dispatch_stages_mxfp8<BM, 32, 8>(stages, x, x_scales, w, w_scales, w2, w2_scales, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, cluster, stream);
+                dispatch_stages_mxfp8<BM, 32, 8>(stages, x, x_scales, w, w_scales, w2, w2_scales, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, split, stream);
                 break;
             case (64<<8)+4:
-                dispatch_stages_mxfp8<BM, 64, 4>(stages, x, x_scales, w, w_scales, w2, w2_scales, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, cluster, stream);
+                dispatch_stages_mxfp8<BM, 64, 4>(stages, x, x_scales, w, w_scales, w2, w2_scales, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, split, stream);
                 break;
             default: throw std::runtime_error {"Invalid BN and WN: "+std::to_string(bn)+" and "+std::to_string(wn)};
         }
@@ -964,7 +964,7 @@ namespace pi {
         int warp_n,
         int stages,
         int bpc,
-        int cluster,
+        bool split,
         cudaStream_t stream
     ) {
         if (bpc != 1)
@@ -996,7 +996,7 @@ namespace pi {
                     num_experts,
                     sorted_num,
                     block_m,
-                    cluster,
+                    split,
                     stream
                 );
                 break;

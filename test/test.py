@@ -157,9 +157,10 @@ def test_cfg(num_tokens, K, E, N, top_k, block_m, bn, wn, stages):
     topk_weights = torch.nn.functional.softmax(torch.randn((num_tokens, top_k), dtype=torch.float32, device='cuda:0'), dim=-1)
     out = torch.zeros_like(x, dtype=torch.bfloat16, device='cuda:0')
     sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size_simple(topk_ids, block_m, E)
-    # trailing ints: bpc=1, cpc=1, cluster=1 (single fused kernel, no multicast)
+    # trailing args: bpc=1, cpc=1, split=False (the single fused kernel; `out` is
+    # pre-zeroed above, which the fused path requires and the split path does itself)
     torch.ops.prime_moe.fused_moe_bf16(
-        x, w1, w2, sorted_token_ids, expert_ids, num_tokens_post_padded, topk_weights, out, top_k, block_m, bn, wn, stages, 1, 1, 1
+        x, w1, w2, sorted_token_ids, expert_ids, num_tokens_post_padded, topk_weights, out, top_k, block_m, bn, wn, stages, 1, 1, False
     )
     torch.cuda.synchronize()
     out_naive = moe_naive_from_topk(x, w1, w2, topk_ids, topk_weights)

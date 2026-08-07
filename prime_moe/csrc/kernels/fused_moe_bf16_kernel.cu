@@ -750,15 +750,12 @@ namespace pi {
         int sorted_num,
         int block_m,
         cudaStream_t stream,
-        int cluster = 1
+        bool split = true
     ) {
-        switch (cluster) {
-            case 1: launch_fused_moe_kernel_impl<BM, BN, WN, STAGES, BPC, CPC>(x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream); break;
-            case 2: throw std::runtime_error {"cluster=2 (2-SM pairs) was removed: never beat the plain path"};
-            case 4: throw std::runtime_error {"cluster=4 was replaced by the octet merge, use cluster=8"};
-            case 8: launch_fused_moe_kernel_impl<BM, BN, WN, STAGES, BPC, CPC, true>(x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream); break;
-            default: throw std::runtime_error {"cluster must be 1, 2, 4 or 8, got "+std::to_string(cluster)};
-        }
+        if (split)
+            launch_fused_moe_kernel_impl<BM, BN, WN, STAGES, BPC, CPC, true>(x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream);
+        else
+            launch_fused_moe_kernel_impl<BM, BN, WN, STAGES, BPC, CPC>(x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream);
     }
 
     template <int BM, int BN, int WN, int STAGES>
@@ -781,11 +778,11 @@ namespace pi {
         int sorted_num,
         int block_m,
         cudaStream_t stream,
-        int cluster
+        bool split
     ) {
         if (bpc != 1 || cpc != 1)
             throw std::runtime_error {"bpc=cpc=1 is the only supported configuration (variant paths were removed)"};
-        launch_fused_moe_kernel<BM, BN, WN, STAGES, 1, 1>(x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream, cluster);
+        launch_fused_moe_kernel<BM, BN, WN, STAGES, 1, 1>(x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream, split);
     }
 
     template <int BM, int BN, int WN>
@@ -809,14 +806,14 @@ namespace pi {
         int sorted_num,
         int block_m,
         cudaStream_t stream,
-        int cluster
+        bool split
     ) {
         switch (stages) {
-            case 1: dispatch_cpc<BM, BN, WN, 1>(bpc, cpc, x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream, cluster); break;
-            case 2: dispatch_cpc<BM, BN, WN, 2>(bpc, cpc, x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream, cluster); break;
-            case 3: dispatch_cpc<BM, BN, WN, 3>(bpc, cpc, x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream, cluster); break;
-            case 4: dispatch_cpc<BM, BN, WN, 4>(bpc, cpc, x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream, cluster); break;
-            case 5: dispatch_cpc<BM, BN, WN, 5>(bpc, cpc, x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream, cluster); break;
+            case 1: dispatch_cpc<BM, BN, WN, 1>(bpc, cpc, x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream, split); break;
+            case 2: dispatch_cpc<BM, BN, WN, 2>(bpc, cpc, x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream, split); break;
+            case 3: dispatch_cpc<BM, BN, WN, 3>(bpc, cpc, x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream, split); break;
+            case 4: dispatch_cpc<BM, BN, WN, 4>(bpc, cpc, x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream, split); break;
+            case 5: dispatch_cpc<BM, BN, WN, 5>(bpc, cpc, x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream, split); break;
             default: throw std::runtime_error {"Invalid stages: "+std::to_string(stages)};
         }
     }
@@ -844,11 +841,11 @@ namespace pi {
         int sorted_num,
         int block_m,
         cudaStream_t stream,
-        int cluster
+        bool split
     ) {
         switch (((bn&0xff)<<8)+(wn&0xff)) {
-            case (32<<8)+8: dispatch_stages<BM, 32, 8>(stages, bpc, cpc, x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream, cluster); break;
-            case (64<<8)+4: dispatch_stages<BM, 64, 4>(stages, bpc, cpc, x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream, cluster); break;
+            case (32<<8)+8: dispatch_stages<BM, 32, 8>(stages, bpc, cpc, x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream, split); break;
+            case (64<<8)+4: dispatch_stages<BM, 64, 4>(stages, bpc, cpc, x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream, split); break;
             default: throw std::runtime_error {"Invalid BN and WN: "+std::to_string(bn)+" and "+std::to_string(wn)};
         }
     }
@@ -951,12 +948,12 @@ namespace pi {
         int stages,
         int bpc,
         int cpc,
-        int cluster,
+        bool split,
         cudaStream_t stream
     ) {
         switch (block_m) {
             case 128:
-                dispatch_bn_wn<128>(block_n, warp_n, stages, bpc, cpc, x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream, cluster);
+                dispatch_bn_wn<128>(block_n, warp_n, stages, bpc, cpc, x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream, split);
                 break;
             default:
                 throw std::runtime_error{

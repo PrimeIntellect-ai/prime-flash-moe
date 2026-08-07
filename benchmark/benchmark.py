@@ -272,7 +272,7 @@ def torch_grouped_mxfp8(
 
 
 def fused_bf16(state: dict) -> torch.Tensor:
-    if state['cluster'] != 8:
+    if not state['split']:
         state['out'].zero_()
     torch.ops.prime_moe.fused_moe_bf16(
         state['x'],
@@ -290,13 +290,13 @@ def fused_bf16(state: dict) -> torch.Tensor:
         state['stages'],
         state['bpc'],
         state['cpc'],
-        state['cluster'],
+        state['split'],
     )
     return state['out']
 
 
 def fused_mxfp8(state: dict) -> torch.Tensor:
-    if state['cluster'] != 8:
+    if not state['split']:
         state['out'].zero_()
     torch.ops.prime_moe.fused_moe_mxfp8(
         state['x'],
@@ -316,7 +316,7 @@ def fused_mxfp8(state: dict) -> torch.Tensor:
         state['wn'],
         state['stages'],
         state['bpc'],
-        state['cluster'],
+        state['split'],
     )
     return state['out']
 
@@ -362,10 +362,10 @@ def approx_flops(num_tokens: int, top_k: int, K: int, N: int) -> float:
 def run_one(dtype: str, num_tokens: int, args: argparse.Namespace) -> dict:
     E, K, N, top_k = args.experts, args.hidden, 2 * args.inter, args.top_k
     block_m = args.block_m
-    cluster = args.cluster if args.cluster is not None else 8  # the split pipeline wins at every size for both dtypes
+    split = args.split
     # mxfp8 runs 1 CTA/SM (tmem-capped), so it profits from a deeper ring; bf16 needs
     # the shallow ring to keep 2 CTAs/SM
-    stages = args.stages if args.stages is not None else (4 if dtype == 'mxfp8' and cluster == 8 else 2)
+    stages = args.stages if args.stages is not None else (4 if dtype == 'mxfp8' and split else 2)
     torch.manual_seed(args.seed)
 
     x = torch.empty((num_tokens, K), dtype=torch.bfloat16, device='cuda').normal_(0, 0.05)
@@ -374,9 +374,8 @@ def run_one(dtype: str, num_tokens: int, args: argparse.Namespace) -> dict:
     topk_ids = generate_topk_ids(E, num_tokens, top_k, args.balancedness)
     topk_weights = F.softmax(torch.randn((num_tokens, top_k), dtype=torch.float32, device='cuda'), dim=-1)
 
-    # cluster>1 multicasts weight tiles across cluster CTAs, which requires every cluster to
-    # be single-expert: pad each expert's run to block_m*bpc*cluster rows (same mechanism as
-    # the bpc padding, one factor stronger)
+    # every block_m*bpc row group has to be single-expert, so each expert's run is padded
+    # up to that boundary
     routing = make_routing(topk_ids, block_m, E, args.bpc)
     out = torch.zeros_like(x)
     state = {
@@ -392,7 +391,7 @@ def run_one(dtype: str, num_tokens: int, args: argparse.Namespace) -> dict:
         'stages': stages,
         'bpc': args.bpc,
         'cpc': args.cpc,
-        'cluster': cluster,
+        'split': split,
     }
 
     if dtype == 'bf16':
@@ -636,13 +635,14 @@ def main() -> None:
     p.add_argument('--block-m', type=int, default=128)
     p.add_argument('--bn', type=int, default=64)
     p.add_argument('--wn', type=int, default=4)
-    p.add_argument('--stages', type=int, default=None, help='pipeline ring depth; default: 2 for bf16, 4 for the mxfp8 split pipeline')
+    p.add_argument('--stages', type=int, default=None, help='pipeline ring depth; default: 2 for bf16, 4 for mxfp8 with --split')
     p.add_argument('--bpc', type=int, default=1)
     p.add_argument('--cpc', type=int, default=1, help='bf16 only: intermediate 128-col groups per CTA, cuts the down-projection split-K factor by this much')
     p.add_argument(
-        '--cluster', type=int, default=None, choices=[1, 8],
-        help='1 = single fused kernel, 8 = split pipeline (act materialized once, split-K reds /8). '
-             'Default: 8 — the split pipeline wins at every token count for both dtypes',
+        '--split', action=argparse.BooleanOptionalAction, default=True,
+        help='--split (default) runs the split pipeline: the activation is materialized once and the '
+             'down-projection split-K disappears. --no-split runs the single fused kernel, which keeps '
+             'the activation on chip and pays a split-K reduction that grows with token count.',
     )
     p.add_argument('--iters', type=int, default=50)
     p.add_argument('--warmup', type=int, default=10)

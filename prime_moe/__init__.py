@@ -19,7 +19,7 @@ def fused_moe_bf16_abstract(
     stages: int,
     bpc: int,
     cpc: int,
-    cluster: int,
+    split: bool,
 ) -> None:
     return None
 
@@ -40,11 +40,11 @@ def fused_moe_bf16(
     stages: int,
     bpc: int = 1,
     cpc: int = 1,
-    cluster: int = 1,
+    split: bool = True,
 ) -> torch.Tensor:
     torch.ops.prime_moe.fused_moe_bf16(
         x, w, w2, sorted_token_ids, expert_ids, num_tokens_post_padded, topk_weights, out,
-        top_k, block_m, block_n, warp_n, stages, bpc, cpc, cluster
+        top_k, block_m, block_n, warp_n, stages, bpc, cpc, split
     )
     return out
 
@@ -67,7 +67,7 @@ def fused_moe_mxfp8_abstract(
     warp_n: int,
     stages: int,
     bpc: int,
-    cluster: int,
+    split: bool,
 ) -> None:
     return None
 
@@ -90,12 +90,12 @@ def fused_moe_mxfp8(
     warp_n: int,
     stages: int,
     bpc: int = 1,
-    cluster: int = 1,
+    split: bool = True,
 ) -> torch.Tensor:
     torch.ops.prime_moe.fused_moe_mxfp8(
         x, x_scales, w, w_scales, w2, w2_scales, sorted_token_ids, expert_ids,
         num_tokens_post_padded, topk_weights, out,
-        top_k, block_m, block_n, warp_n, stages, bpc, cluster
+        top_k, block_m, block_n, warp_n, stages, bpc, split
     )
     return out
 

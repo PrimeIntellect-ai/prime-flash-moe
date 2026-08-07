@@ -156,8 +156,8 @@ def test_cfg(num_tokens, K, E, N, top_k, block_m, bn, wn, stages):
         bn,
         wn,
         stages,
-        1,
-        1,
+        1,      # bpc
+        False,  # split: the single fused kernel, `out` pre-zeroed above
     )
     torch.cuda.synchronize()
 
@@ -219,7 +219,7 @@ def test_public_wrapper():
         x_q, x_sf, w1_q, pack_scales_blocked(w1_sf), w2_q, pack_scales_blocked(w2_sf),
         sorted_token_ids, expert_ids, num_tokens_post_padded, topk_weights,
     )
-    tail = (top_k, block_m, 32, 8, 1, 1, 1)
+    tail = (top_k, block_m, 32, 8, 1, 1, False)   # ..., stages, bpc, split
 
     raw = torch.zeros((T, K), dtype=torch.bfloat16, device='cuda:0')
     torch.ops.prime_moe.fused_moe_mxfp8(*args, raw, *tail)
