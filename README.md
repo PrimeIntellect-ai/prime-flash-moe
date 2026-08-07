@@ -164,8 +164,3 @@ good run and tighten.
 
 The mxfp8 reference dequantizes both sides back to bf16 and runs the naive path, so the
 comparison isolates the kernel rather than the quantizer.
-
-## Status
-
-Pre-1.0. The bf16 path is the more exercised of the two; the mxfp8 path is newer. There is
-no CI — the test scripts are the gate, and they need to run on a Blackwell machine.
