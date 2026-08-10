@@ -163,18 +163,29 @@ prime_moe.fused_moe_mxfp8(
 Pack the weight scales once at load time, not per step.
 
 ## Tests and benchmarks
-
+To run benchmarks and tests use:
 ```sh
 python test/test.py           # bf16 path vs a torch._grouped_mm reference
 python test/test_mxfp8.py     # mxfp8 path vs the same reference on dequantized values
 python benchmark/benchmark.py --check --iters 1000
 ```
+Our benchmarks:
 
-Both test scripts sweep shapes and tuning configs, print per-config error statistics, and
-exit non-zero if any config exceeds its accuracy gate. The gates (`REL_CLAMP_10_MAX`,
-`REL_CLAMP_1_MAX` at the top of each file) are starting estimates and can be overridden
-with `PRIME_MOE_REL_CLAMP_10` / `PRIME_MOE_REL_CLAMP_1`; calibrate them against a known
-good run and tighten.
+- GPU: 8× NVIDIA B200 (P0, 1965 MHz SM, 3996 MHz HBM)
+- Driver: 580.159.03
+- PyTorch: 2.13.0+cu130
+- CUDA (PyTorch build): 13.0
+- cuDNN: 9.19.0
+- Python: 3.14.6
+- OS: Ubuntu 22.04.5 LTS
+- CPU: Intel Xeon 6760P
 
-The mxfp8 reference dequantizes both sides back to bf16 and runs the naive path, so the
-comparison isolates the kernel rather than the quantizer.
+<img width="2125" height="850" alt="moe_bench_mxfp8" src="https://github.com/user-attachments/assets/327e57b2-ed10-4c09-8b09-5fd4abc1012a" />
+<img width="2125" height="850" alt="moe_bench_bf16" src="https://github.com/user-attachments/assets/794ddc5e-d086-48bb-9a29-cfcd1b21b25b" />
+
+For MXFP8 we have a second plot with the intermediate requantization switched off - the up projection stays MXFP8, but the SwiGLU output goes straight into a bf16 grouped_mm. This baseline intentionally measures a different question. It skips the intermediate requantization pass, isolating the cost of moving the activation through HBM. The fused kernel does perform the intermediate requantization, so this baseline both skips a full quantization pass over the activation. It is still worth plotting, because the gap between the two baselines is exactly the price of the requantization round trip through HBM, which is the work the fused kernel absorbs on chip between the two MMAs.
+
+<img width="2125" height="850" alt="moe_bench_mxfp8_noreq" src="https://github.com/user-attachments/assets/a45b8b51-ff40-4dbd-b650-d47ec0b4bc1b" />
+
+
+
