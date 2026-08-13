@@ -421,8 +421,26 @@ namespace pi {
     };
     static_assert(sizeof(barrier) == sizeof(uint64_t) && alignof(barrier) == alignof(uint64_t));
 
+    enum class GluActivation { SWIGLU, SITUGLU };
+
+    // beta1 and beta2 are the constants used by situ-glu in the kimi k3 technical report.
+    static constexpr float SITUGLU_GATE_BETA = 4.f;
+    static constexpr float SITUGLU_UP_BETA = 25.f;
+
     [[nodiscard]] static __device__ __forceinline__ float swiglu(float x, float w) {
         return w*(x/(1.f+__expf(-x)));
+    }
+
+    // h = [beta1*tanh(g/beta1)*sigmoid(g)]*[beta2*tanh(u/beta2)], bounded by beta1*beta2.
+    [[nodiscard]] static __device__ __forceinline__ float situglu(float x, float w) {
+        float gate = SITUGLU_GATE_BETA*tanhf(x/SITUGLU_GATE_BETA)/(1.f+__expf(-x));
+        return gate*(SITUGLU_UP_BETA*tanhf(w/SITUGLU_UP_BETA));
+    }
+
+    template <GluActivation ACT>
+    [[nodiscard]] static __device__ __forceinline__ float glu(float x, float w) {
+        if constexpr (ACT == GluActivation::SITUGLU) return situglu(x, w);
+        else return swiglu(x, w);
     }
 
     __device__ __forceinline__ void red_global_add_bf16x8(__nv_bfloat16 *dst, const float *v, float scale) {

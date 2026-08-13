@@ -1,6 +1,9 @@
 import torch
 from . import _C
 
+SWIGLU = 0
+SITUGLU = 1
+
 
 @torch.library.register_fake('prime_moe::fused_moe_bf16')
 def fused_moe_bf16_abstract(
@@ -20,6 +23,7 @@ def fused_moe_bf16_abstract(
     bpc: int,
     cpc: int,
     split: bool,
+    activation: int,
 ) -> None:
     return None
 
@@ -41,10 +45,11 @@ def fused_moe_bf16(
     bpc: int = 1,
     cpc: int = 1,
     split: bool = True,
+    activation: int = SWIGLU,
 ) -> torch.Tensor:
     torch.ops.prime_moe.fused_moe_bf16(
         x, w, w2, sorted_token_ids, expert_ids, num_tokens_post_padded, topk_weights, out,
-        top_k, block_m, block_n, warp_n, stages, bpc, cpc, split
+        top_k, block_m, block_n, warp_n, stages, bpc, cpc, split, activation
     )
     return out
 
@@ -68,6 +73,7 @@ def fused_moe_mxfp8_abstract(
     stages: int,
     bpc: int,
     split: bool,
+    activation: int,
 ) -> None:
     return None
 
@@ -91,11 +97,12 @@ def fused_moe_mxfp8(
     stages: int,
     bpc: int = 1,
     split: bool = True,
+    activation: int = SWIGLU,
 ) -> torch.Tensor:
     torch.ops.prime_moe.fused_moe_mxfp8(
         x, x_scales, w, w_scales, w2, w2_scales, sorted_token_ids, expert_ids,
         num_tokens_post_padded, topk_weights, out,
-        top_k, block_m, block_n, warp_n, stages, bpc, split
+        top_k, block_m, block_n, warp_n, stages, bpc, split, activation
     )
     return out
 
@@ -119,4 +126,6 @@ __all__ = [
     'fused_moe_mxfp8',
     'pack_scales_blocked',
     'BLOCK',
+    'SWIGLU',
+    'SITUGLU',
 ]
