@@ -79,7 +79,7 @@ namespace pi {
         }
     }
 
-    template <int BM, int BK, int BN, int WN, int STAGES, int PRODUCER_THREADS, bool SPLIT_UP = false>
+    template <int BM, int BK, int BN, int WN, int STAGES, int PRODUCER_THREADS, bool SPLIT_UP = false, GluActivation ACT = GluActivation::SWIGLU>
     static __global__ __launch_bounds__(WN*32 + PRODUCER_THREADS) void fused_moe_mxfp8_kernel(
         const __nv_fp8_e4m3 *__restrict__ x,
         const uint8_t *__restrict__ x_scales,
@@ -385,7 +385,7 @@ namespace pi {
                         tcgen05::await_ld();
                         #pragma unroll
                         for (int e=0; e < 32; ++e) {
-                            float v = swiglu(gate[e], act[e]);
+                            float v = glu<ACT>(gate[e], act[e]);
                             act[e] = v;
                             amax = fmaxf(amax, fabsf(v));
                         }
@@ -678,7 +678,7 @@ namespace pi {
             tcgen05::tmem_free(tmem_acc, 512);
     }
 
-    template <int BM, int BN, int WN, int STAGES, bool SPLIT = false>
+    template <int BM, int BN, int WN, int STAGES, bool SPLIT = false, GluActivation ACT = GluActivation::SWIGLU>
     static void launch_fused_moe_mxfp8_kernel(
         const __nv_fp8_e4m3 *x,
         const uint8_t *x_scales,
@@ -712,7 +712,7 @@ namespace pi {
             static_cast<uint32_t>(std::ceil(static_cast<double>(sorted_num)/static_cast<double>(block_m))),
             1
         };
-        auto *kernel = fused_moe_mxfp8_kernel<BM, BK, BN, WN, STAGES, PRODUCER_THREADS, SPLIT>;
+        auto *kernel = fused_moe_mxfp8_kernel<BM, BK, BN, WN, STAGES, PRODUCER_THREADS, SPLIT, ACT>;
         if (cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM) != cudaSuccess)
             throw std::runtime_error {"Failed to set max dynamic shared memory size for fused_moe_mxfp8_kernel: "+std::to_string(SMEM)+" bytes"};
 
@@ -865,7 +865,7 @@ namespace pi {
         }
     }
 
-    template <int BM, int BN, int WN>
+    template <int BM, int BN, int WN, GluActivation ACT = GluActivation::SWIGLU>
     static void dispatch_stages_mxfp8(
         int stages,
         const __nv_fp8_e4m3 *x,
@@ -890,9 +890,9 @@ namespace pi {
         cudaStream_t stream
     ) {
         #define launch_mxfp8(s) \
-            do { if (split) launch_fused_moe_mxfp8_kernel<BM, BN, WN, s, true>(x, x_scales, w, w_scales, w2, w2_scales, out, sorted_token_ids, expert_idxs, \
+            do { if (split) launch_fused_moe_mxfp8_kernel<BM, BN, WN, s, true, ACT>(x, x_scales, w, w_scales, w2, w2_scales, out, sorted_token_ids, expert_idxs, \
             num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream); \
-            else launch_fused_moe_mxfp8_kernel<BM, BN, WN, s>(x, x_scales, w, w_scales, w2, w2_scales, out, sorted_token_ids, expert_idxs, \
+            else launch_fused_moe_mxfp8_kernel<BM, BN, WN, s, false, ACT>(x, x_scales, w, w_scales, w2, w2_scales, out, sorted_token_ids, expert_idxs, \
             num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream); } while (0)
         switch (stages) {
             case 1: launch_mxfp8(1); break;
@@ -904,7 +904,7 @@ namespace pi {
         #undef launch_mxfp8
     }
 
-    template <int  BM>
+    template <int  BM, GluActivation ACT = GluActivation::SWIGLU>
     static void dispatch_bn_wn_mxfp8(
         int bn,
         int wn,
@@ -932,10 +932,10 @@ namespace pi {
     ) {
         switch (((bn&0xff)<<8)+(wn&0xff)) {
             case (32<<8)+8:
-                dispatch_stages_mxfp8<BM, 32, 8>(stages, x, x_scales, w, w_scales, w2, w2_scales, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, split, stream);
+                dispatch_stages_mxfp8<BM, 32, 8, ACT>(stages, x, x_scales, w, w_scales, w2, w2_scales, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, split, stream);
                 break;
             case (64<<8)+4:
-                dispatch_stages_mxfp8<BM, 64, 4>(stages, x, x_scales, w, w_scales, w2, w2_scales, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, split, stream);
+                dispatch_stages_mxfp8<BM, 64, 4, ACT>(stages, x, x_scales, w, w_scales, w2, w2_scales, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, split, stream);
                 break;
             default: throw std::runtime_error {"Invalid BN and WN: "+std::to_string(bn)+" and "+std::to_string(wn)};
         }
@@ -974,7 +974,34 @@ namespace pi {
             };
         switch (block_m) {
             case 128:
-                dispatch_bn_wn_mxfp8<128>(
+                if (activation == 1)
+                dispatch_bn_wn_mxfp8<128, GluActivation::SITUGLU>(
+                    block_n,
+                    warp_n,
+                    stages,
+                    x,
+                    reinterpret_cast<const uint8_t *>(x_scales),
+                    w,
+                    reinterpret_cast<const uint8_t *>(w_scales),
+                    w2,
+                    reinterpret_cast<const uint8_t *>(w2_scales),
+                    out,
+                    sorted_token_ids,
+                    expert_idxs,
+                    num_tokens_post_padded,
+                    topk_weights,
+                    top_k,
+                    M,
+                    K,
+                    N,
+                    num_experts,
+                    sorted_num,
+                    block_m,
+                    split,
+                    stream
+                );
+                else
+                dispatch_bn_wn_mxfp8<128, GluActivation::SWIGLU>(
                     block_n,
                     warp_n,
                     stages,

@@ -30,6 +30,7 @@ namespace pi {
         int bpc,
         int cpc,
         bool split,
+        int activation,
         cudaStream_t stream
     );
 
@@ -57,6 +58,7 @@ namespace pi {
         int stages,
         int bpc,
         bool split,
+        int activation,
         cudaStream_t stream
     );
 
@@ -125,7 +127,8 @@ namespace pi {
         int64_t stages,
         int64_t bpc,
         int64_t cpc,
-        bool split
+        bool split,
+        int64_t activation
     ) {
         cudaStream_t stream = at::cuda::getCurrentCUDAStream();
         at::cuda::OptionalCUDAGuard device_guard {device_of(x)};
@@ -134,6 +137,7 @@ namespace pi {
         TORCH_CHECK((x.size(1)&127) == 0, "K dimension must be a multiple of 128");
         TORCH_CHECK((block_n == 64 && warp_n == 4) || (block_n == 32 && warp_n == 8));
         TORCH_CHECK(stages > 0 && stages < 6);
+        TORCH_CHECK(activation == 0 || activation == 1, "activation must be 0 (swiglu) or 1 (situglu)");
         TORCH_CHECK(bpc == 1 && cpc == 1, "bpc=cpc=1 is the only supported configuration");
         TORCH_CHECK(!split || stages <= 4, "split=True requires stages<=4, got stages="+std::to_string(stages));
         TORCH_CHECK(block_m == 128, "Blackwell tcgen05 fused MoE requires block_m=128.");
@@ -175,6 +179,7 @@ namespace pi {
             bpc,
             cpc,
             split,
+            activation,
             stream
         );
     }
@@ -197,7 +202,8 @@ namespace pi {
         int64_t warp_n,
         int64_t stages,
         int64_t bpc,
-        bool split
+        bool split,
+        int64_t activation
     ) {
         cudaStream_t stream = at::cuda::getCurrentCUDAStream();
         at::cuda::OptionalCUDAGuard device_guard {device_of(x)};
@@ -212,6 +218,7 @@ namespace pi {
         TORCH_CHECK(w2.size(0) == E && w2.size(1) == K && w2.size(2) == N/2);
         TORCH_CHECK((block_n == 64 && warp_n == 4) || (block_n == 32 && warp_n == 8));
         TORCH_CHECK(stages > 0 && stages < 5, "mxfp8 supports stages in 1..4");
+        TORCH_CHECK(activation == 0 || activation == 1, "activation must be 0 (swiglu) or 1 (situglu)");
         TORCH_CHECK(bpc == 1, "mxfp8 supports bpc=1 only: tensor memory has no room for a second accumulator plus scale factors");
         TORCH_CHECK(block_m == 128, "Blackwell tcgen05 fused MoE requires block_m=128.");
         TORCH_CHECK(x_scales.numel() == M*(K/32), "x_scales must be a row major (M, K/32) e8m0 tensor");
@@ -263,6 +270,7 @@ namespace pi {
             stages,
             bpc,
             split,
+            activation,
             stream
         );
     }
@@ -285,7 +293,8 @@ TORCH_LIBRARY_FRAGMENT(prime_moe, m) {
         "int stages, "
         "int bpc, "
         "int cpc, "
-        "bool split=True"
+        "bool split=True, "
+        "int activation=0"
         ") -> ()"
     );
     m.impl("fused_moe_bf16", torch::kCUDA, &pi::fused_moe_bf16_torch_stub);
@@ -308,7 +317,8 @@ TORCH_LIBRARY_FRAGMENT(prime_moe, m) {
         "int warp_n, "
         "int stages, "
         "int bpc, "
-        "bool split=True"
+        "bool split=True, "
+        "int activation=0"
         ") -> ()"
     );
     m.impl("fused_moe_mxfp8", torch::kCUDA, &pi::fused_moe_mxfp8_torch_stub);

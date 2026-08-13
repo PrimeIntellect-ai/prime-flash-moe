@@ -18,7 +18,7 @@ namespace pi {
     static cudaStream_t g_zstream = nullptr;
     static cudaEvent_t g_e_head = nullptr, g_e_zero = nullptr;
 
-    template <int BM, int BK, int BN, int WN, int STAGES, int PRODUCER_THREADS, int BPC, int CPC, bool SPLIT_UP = false>
+    template <int BM, int BK, int BN, int WN, int STAGES, int PRODUCER_THREADS, int BPC, int CPC, bool SPLIT_UP = false, GluActivation ACT = GluActivation::SWIGLU>
     static __global__ __launch_bounds__(WN*32+PRODUCER_THREADS, 2) void fused_moe_kernel(
         const __nv_bfloat16 *__restrict__ x,
         const __nv_bfloat16 *__restrict__ w_global,
@@ -251,7 +251,7 @@ namespace pi {
                                 auto *dst = act_smem+slot*DXS+((((c32<<2)+i)*BM+tmem_row)<<3);
                                 #pragma unroll
                                 for (int e=0; e < 8; ++e)
-                                    dst[e] = __float2bfloat16(swiglu(gate[(i<<3)+e], up[(i<<3)+e]));
+                                    dst[e] = __float2bfloat16(glu<ACT>(gate[(i<<3)+e], up[(i<<3)+e]));
                             }
                         }
                         if constexpr (SPLIT_UP) {
@@ -546,7 +546,7 @@ namespace pi {
     }
 
 
-    template <int BM, int BN, int WN, int STAGES, int BPC, int CPC, bool SPLIT = false>
+    template <int BM, int BN, int WN, int STAGES, int BPC, int CPC, bool SPLIT = false, GluActivation ACT = GluActivation::SWIGLU>
     static void launch_fused_moe_kernel_impl(
         const __nv_bfloat16 *x,
         const __nv_bfloat16 *w,
@@ -582,7 +582,7 @@ namespace pi {
             static_cast<uint32_t>(std::ceil(static_cast<double>(sorted_num)/static_cast<double>(block_m*BPC))),
             1
         };
-        auto *kernel = fused_moe_kernel<BM, BK, BN, WN, STAGES, PRODUCER_THREADS, BPC, CPC, SP>;
+        auto *kernel = fused_moe_kernel<BM, BK, BN, WN, STAGES, PRODUCER_THREADS, BPC, CPC, SP, ACT>;
         if (cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM) != cudaSuccess)
             throw std::runtime_error {"Failed to set max dynamic shared memory size for fused_moe_kernel: "+std::to_string(SMEM)+" bytes"};
 
@@ -732,7 +732,7 @@ namespace pi {
         }
     }
 
-    template <int BM, int BN, int WN, int STAGES, int BPC = 2, int CPC = 1>
+    template <int BM, int BN, int WN, int STAGES, int BPC = 2, int CPC = 1, GluActivation ACT = GluActivation::SWIGLU>
     static void launch_fused_moe_kernel(
         const __nv_bfloat16 *x,
         const __nv_bfloat16 *w,
@@ -753,12 +753,12 @@ namespace pi {
         bool split = true
     ) {
         if (split)
-            launch_fused_moe_kernel_impl<BM, BN, WN, STAGES, BPC, CPC, true>(x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream);
+            launch_fused_moe_kernel_impl<BM, BN, WN, STAGES, BPC, CPC, true, ACT>(x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream);
         else
-            launch_fused_moe_kernel_impl<BM, BN, WN, STAGES, BPC, CPC>(x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream);
+            launch_fused_moe_kernel_impl<BM, BN, WN, STAGES, BPC, CPC, false, ACT>(x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream);
     }
 
-    template <int BM, int BN, int WN, int STAGES>
+    template <int BM, int BN, int WN, int STAGES, GluActivation ACT = GluActivation::SWIGLU>
     static void dispatch_cpc(
         int bpc,
         int cpc,
@@ -782,10 +782,10 @@ namespace pi {
     ) {
         if (bpc != 1 || cpc != 1)
             throw std::runtime_error {"bpc=cpc=1 is the only supported configuration (variant paths were removed)"};
-        launch_fused_moe_kernel<BM, BN, WN, STAGES, 1, 1>(x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream, split);
+        launch_fused_moe_kernel<BM, BN, WN, STAGES, 1, 1, ACT>(x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream, split);
     }
 
-    template <int BM, int BN, int WN>
+    template <int BM, int BN, int WN, GluActivation ACT = GluActivation::SWIGLU>
     static void dispatch_stages(
         int stages,
         int bpc,
@@ -809,16 +809,16 @@ namespace pi {
         bool split
     ) {
         switch (stages) {
-            case 1: dispatch_cpc<BM, BN, WN, 1>(bpc, cpc, x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream, split); break;
-            case 2: dispatch_cpc<BM, BN, WN, 2>(bpc, cpc, x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream, split); break;
-            case 3: dispatch_cpc<BM, BN, WN, 3>(bpc, cpc, x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream, split); break;
-            case 4: dispatch_cpc<BM, BN, WN, 4>(bpc, cpc, x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream, split); break;
-            case 5: dispatch_cpc<BM, BN, WN, 5>(bpc, cpc, x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream, split); break;
+            case 1: dispatch_cpc<BM, BN, WN, 1, ACT>(bpc, cpc, x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream, split); break;
+            case 2: dispatch_cpc<BM, BN, WN, 2, ACT>(bpc, cpc, x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream, split); break;
+            case 3: dispatch_cpc<BM, BN, WN, 3, ACT>(bpc, cpc, x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream, split); break;
+            case 4: dispatch_cpc<BM, BN, WN, 4, ACT>(bpc, cpc, x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream, split); break;
+            case 5: dispatch_cpc<BM, BN, WN, 5, ACT>(bpc, cpc, x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream, split); break;
             default: throw std::runtime_error {"Invalid stages: "+std::to_string(stages)};
         }
     }
 
-    template <int BM>
+    template <int BM, GluActivation ACT = GluActivation::SWIGLU>
     static void dispatch_bn_wn(
         int bn,
         int wn,
@@ -844,8 +844,8 @@ namespace pi {
         bool split
     ) {
         switch (((bn&0xff)<<8)+(wn&0xff)) {
-            case (32<<8)+8: dispatch_stages<BM, 32, 8>(stages, bpc, cpc, x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream, split); break;
-            case (64<<8)+4: dispatch_stages<BM, 64, 4>(stages, bpc, cpc, x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream, split); break;
+            case (32<<8)+8: dispatch_stages<BM, 32, 8, ACT>(stages, bpc, cpc, x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream, split); break;
+            case (64<<8)+4: dispatch_stages<BM, 64, 4, ACT>(stages, bpc, cpc, x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream, split); break;
             default: throw std::runtime_error {"Invalid BN and WN: "+std::to_string(bn)+" and "+std::to_string(wn)};
         }
     }
@@ -949,11 +949,15 @@ namespace pi {
         int bpc,
         int cpc,
         bool split,
+        int activation,
         cudaStream_t stream
     ) {
         switch (block_m) {
             case 128:
-                dispatch_bn_wn<128>(block_n, warp_n, stages, bpc, cpc, x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream, split);
+                if (activation == 1)
+                    dispatch_bn_wn<128, GluActivation::SITUGLU>(block_n, warp_n, stages, bpc, cpc, x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream, split);
+                else
+                    dispatch_bn_wn<128, GluActivation::SWIGLU>(block_n, warp_n, stages, bpc, cpc, x, w, w2, out, sorted_token_ids, expert_idxs, num_tokens_post_padded, topk_weights, top_k, M, K, N, num_experts, sorted_num, block_m, stream, split);
                 break;
             default:
                 throw std::runtime_error{
